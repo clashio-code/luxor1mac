@@ -60,6 +60,12 @@ jobs:
           if [ -n "$MODEL" ]; then
             EXTRA=("-DLUXOR_CPU_MODEL=$MODEL" "-DLUXOR_CPU_MODEL_STR=\"$MODEL\"")
           fi
+          if grep -q "uc_ctl_set_tcg_buffer_size" unicorn/include/unicorn/unicorn.h; then
+            EXTRA+=("-DHAVE_TCG_BUFFER_CTL")
+            echo "Kontrol buffer TCG: ada"
+          else
+            echo "Kontrol buffer TCG: TIDAK ada di header"
+          fi
           mkdir -p out
           gcc -O2 -Wall -Iunicorn/include "${EXTRA[@]}" "$SRC" -o out/luxor_mac_loader \
             -static -Wl,--start-group $(find unicorn/build -name '*.a' | tr '\n' ' ') -Wl,--end-group -lpthread -lm
