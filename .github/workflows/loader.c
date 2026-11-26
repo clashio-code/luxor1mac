@@ -22,6 +22,8 @@
 #include <stdarg.h>
 #include <time.h>
 #include <errno.h>
+#include <unistd.h>
+#include <ctype.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 
@@ -406,12 +408,46 @@ static uint32_t data_alloc(uint32_t n)
     return a;
 }
 
+
+/* ---- tabel karakter ala Darwin (isalpha dll. dibaca game langsung dari memori) ---- */
+static uint32_t rune_flags(uint32_t c)
+{
+    if (c >= 128) return 0;
+    uint32_t f = 0;
+    if (isalpha((int)c))  f |= 0x100;
+    if (iscntrl((int)c))  f |= 0x200;
+    if (isdigit((int)c))  f |= 0x400;
+    if (isgraph((int)c))  f |= 0x800;
+    if (islower((int)c))  f |= 0x1000;
+    if (ispunct((int)c))  f |= 0x2000;
+    if (isspace((int)c))  f |= 0x4000;
+    if (isupper((int)c))  f |= 0x8000;
+    if (isxdigit((int)c)) f |= 0x10000;
+    if (c == ' ' || c == '\t') f |= 0x20000;
+    if (isprint((int)c))  f |= 0x40000;
+    return f;
+}
+static uint32_t g_rune_tbl;
+static uint32_t rune_table(void)
+{
+    if (g_rune_tbl) return g_rune_tbl;
+    g_rune_tbl = data_alloc(0x1000);
+    uint8_t *t = g2h(g_rune_tbl, 0x1000);
+    if (!t) return g_rune_tbl;
+    memcpy(t, "RuneMagA", 8);
+    memcpy(t + 8, "NONE", 5);
+    for (uint32_t i = 0; i < 256; i++) {
+        wbe32(t + 52 + i * 4, rune_flags(i));
+        wbe32(t + 52 + 1024 + i * 4, i < 128 ? (uint32_t)tolower((int)i) : i);
+        wbe32(t + 52 + 2048 + i * 4, i < 128 ? (uint32_t)toupper((int)i) : i);
+    }
+    return g_rune_tbl;
+}
+
 static uint32_t hle_symbol(const char *name, int want_data)
 {
     Hle *h = hle_find(name);
     if (h) {
-        if (want_data == 1 && !h->is_data)
-            LOG("WARN: simbol %s dipakai sebagai data tapi sudah jadi fungsi\n", name);
         return h->addr;
     }
     if (g_nhle == g_caphle) {
@@ -427,10 +463,18 @@ static uint32_t hle_symbol(const char *name, int want_data)
     if (h->known) want_data = 0;
     h->is_data = want_data;
     if (want_data) {
-        uint32_t sz = 256;
-        if (!strcmp(name, "___sF")) sz = 0x400;
-        else if (strstr(name, "RuneLocale")) sz = 0x3000;
-        h->addr = data_alloc(sz);
+        if (!strcmp(name, "__CurrentRuneLocale")) {
+            h->addr = data_alloc(16);
+            uint32_t tb = rune_table();
+            uint8_t *pp = g2h(h->addr, 4);
+            if (pp) wbe32(pp, tb);
+        } else if (!strcmp(name, "__DefaultRuneLocale")) {
+            h->addr = rune_table();
+        } else {
+            uint32_t sz = 256;
+            if (!strcmp(name, "___sF")) sz = 0x400;
+            h->addr = data_alloc(sz);
+        }
     } else {
         if (g_trap_slots * 16 >= TRAP_SIZE) { LOG("FATAL: trap slot habis\n"); exit(2); }
         h->addr = TRAP_BASE + g_trap_slots++ * 16;
@@ -562,13 +606,12 @@ static uint32_t heap_size(uint32_t a)
 }
 
 /* ============================================================ EMULASI */
-#ifndef DRYRUN
-
 static int g_stop;
 static const char *g_stop_reason = "";
 static int g_trace = 0;
 static int g_tcg_mb = 32;        /* ukuran buffer JIT (MB); bisa diubah dengan --tcg-mb N */
 
+#ifndef DRYRUN
 static uint32_t R(int i)
 {
     uint32_t v = 0;
@@ -605,15 +648,181 @@ static void dump_state(const char *why)
         LOG("  r%-2d=%08x r%-2d=%08x r%-2d=%08x r%-2d=%08x\n", i, R(i), i + 1, R(i + 1), i + 2, R(i + 2), i + 3, R(i + 3));
     uint8_t *b = g2h(pc, 16);
     if (b) LOG("  byte di PC: %02x%02x%02x%02x %02x%02x%02x%02x\n", b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+    {
+        uint8_t *pb = g2h(pc - 4, 4);
+        if (pb && be32(pb) == 0x44000002) {
+            LOG("  instruksi sebelum PC adalah 'sc' (syscall): r0=%u r3=%08x r4=%08x r5=%08x\n", R(0), R(3), R(4), R(5));
+            if (R(0) == 4) LOG("  -> write(fd=%u): \"%s\"\n", R(3), gstr(R(4)));
+            if (R(0) == 1) LOG("  -> exit(%u)\n", R(3));
+        }
+    }
     backtrace();
 }
 
-/* ---- handler HLE ---- */
+#else
+static uint32_t R(int i) { (void)i; return 0; }
+#endif
+
+/* ============================================================ HLE */
+static char g_app_path[700];
+static char g_appdata[700];
+static uint32_t g_errno_addr, g_fake_obj, g_cstr_c;
+static uint32_t g_keymgr[64], g_keymgr_thr[64];
+static int g_use_r4;
+static uint32_t g_r4;
+static double g_t0;
+
+static double mono_s(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+static void hle_state_init(void)
+{
+    g_errno_addr = data_alloc(16);
+    g_fake_obj = data_alloc(128);
+    g_cstr_c = data_alloc(16);
+    uint8_t *p = g2h(g_cstr_c, 2);
+    if (p) { p[0] = 'C'; p[1] = 0; }
+    g_t0 = mono_s();
+}
+
+/* ---- printf ala Darwin PPC: argumen varargs dibaca dari r3..r10 lalu stack ---- */
+typedef struct { int mode; uint32_t k; uint32_t ap; } VaCtx;
+static uint32_t va_next(VaCtx *c)
+{
+    uint32_t v = 0;
+    if (c->mode == 0) {
+        if (c->k < 8) v = R(3 + (int)c->k);
+        else { uint8_t *p = g2h(R(1) + 24 + 4 * c->k, 4); v = p ? be32(p) : 0; }
+        c->k++;
+    } else {
+        uint8_t *p = g2h(c->ap, 4);
+        v = p ? be32(p) : 0;
+        c->ap += 4;
+    }
+    return v;
+}
+
+static size_t guest_format(char *out, size_t cap, const char *fmt, VaCtx *c)
+{
+    size_t n = 0;
+#define PUT(ch) do { if (n + 1 < cap) out[n] = (char)(ch); n++; } while (0)
+    for (const char *f = fmt; *f; f++) {
+        if (*f != '%') { PUT(*f); continue; }
+        f++;
+        if (*f == '%') { PUT('%'); continue; }
+        char spec[40];
+        int sp = 0;
+        spec[sp++] = '%';
+        while (*f && strchr("-+ #0", *f) && sp < 8) spec[sp++] = *f++;
+        if (*f == '*') { int w = (int)va_next(c); sp += snprintf(spec + sp, 12, "%d", w); f++; }
+        else while (*f >= '0' && *f <= '9' && sp < 16) spec[sp++] = *f++;
+        if (*f == '.') {
+            spec[sp++] = '.'; f++;
+            if (*f == '*') { int pv = (int)va_next(c); sp += snprintf(spec + sp, 12, "%d", pv); f++; }
+            else while (*f >= '0' && *f <= '9' && sp < 28) spec[sp++] = *f++;
+        }
+        int lcount = 0;
+        while (*f == 'l' || *f == 'h' || *f == 'z' || *f == 't' || *f == 'j' || *f == 'L' || *f == 'q') {
+            if (*f == 'l' || *f == 'q' || *f == 'j' || *f == 'L') lcount++;
+            f++;
+        }
+        char conv = *f;
+        if (!conv) break;
+        spec[sp] = 0;
+        char tmp[1100];
+        int tl = 0;
+        switch (conv) {
+        case 'd': case 'i': {
+            if (lcount >= 2) {
+                uint32_t hi = va_next(c), lo = va_next(c);
+                long long v = (long long)(((uint64_t)hi << 32) | lo);
+                strcat(spec, "lld");
+                tl = snprintf(tmp, sizeof tmp, spec, v);
+            } else {
+                int v = (int)va_next(c);
+                strcat(spec, "d");
+                tl = snprintf(tmp, sizeof tmp, spec, v);
+            }
+            break; }
+        case 'u': case 'x': case 'X': case 'o': {
+            char suf[4] = { 0, 0, 0, 0 };
+            if (lcount >= 2) {
+                uint32_t hi = va_next(c), lo = va_next(c);
+                unsigned long long v = ((uint64_t)hi << 32) | lo;
+                suf[0] = 'l'; suf[1] = 'l'; suf[2] = conv;
+                strcat(spec, suf);
+                tl = snprintf(tmp, sizeof tmp, spec, v);
+            } else {
+                unsigned v = va_next(c);
+                suf[0] = conv;
+                strcat(spec, suf);
+                tl = snprintf(tmp, sizeof tmp, spec, v);
+            }
+            break; }
+        case 'c': {
+            int v = (int)va_next(c);
+            strcat(spec, "c");
+            tl = snprintf(tmp, sizeof tmp, spec, v);
+            break; }
+        case 's': {
+            uint32_t p = va_next(c);
+            const char *sv = p ? (const char *)g2h(p, 1) : "(null)";
+            if (!sv) sv = "(?)";
+            strcat(spec, "s");
+            tl = snprintf(tmp, sizeof tmp, spec, sv);
+            break; }
+        case 'p': {
+            uint32_t v = va_next(c);
+            tl = snprintf(tmp, sizeof tmp, "0x%x", v);
+            break; }
+        case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case 'a': case 'A': {
+            uint32_t hi = va_next(c), lo = va_next(c);
+            uint64_t bits = ((uint64_t)hi << 32) | lo;
+            double d;
+            memcpy(&d, &bits, 8);
+            char suf[2] = { conv, 0 };
+            strcat(spec, suf);
+            tl = snprintf(tmp, sizeof tmp, spec, d);
+            break; }
+        default:
+            tl = snprintf(tmp, sizeof tmp, "%%%c", conv);
+            break;
+        }
+        if (tl < 0) tl = 0;
+        if (tl >= (int)sizeof tmp) tl = (int)sizeof tmp - 1;
+        for (int i = 0; i < tl; i++) PUT(tmp[i]);
+    }
+    if (cap) out[n < cap ? n : cap - 1] = 0;
+#undef PUT
+    return n;
+}
+
+static uint32_t fmt_to_guest(uint32_t dst, uint32_t size, const char *fmt, VaCtx *c, int has_size)
+{
+    char buf[4096];
+    size_t n = guest_format(buf, sizeof buf, fmt, c);
+    if (n >= sizeof buf) n = sizeof buf - 1;
+    if (!has_size) size = (uint32_t)n + 1;
+    if (size) {
+        uint8_t *d = g2h(dst, size);
+        if (d) {
+            size_t m = n < size - 1 ? n : size - 1;
+            memcpy(d, buf, m);
+            d[m] = 0;
+        }
+    }
+    return (uint32_t)n;
+}
+
 #define H(n) static uint32_t n(uint32_t *a)
 #define UNUSED (void)a
 
 H(h_malloc)  { return heap_alloc(a[0]); }
-H(h_calloc)  { uint32_t n = a[0] * a[1]; return heap_alloc(n); }       /* mmap sudah nol */
+H(h_calloc)  { return heap_alloc(a[0] * a[1]); }
 H(h_free)    { UNUSED; return 0; }
 H(h_realloc) {
     if (!a[0]) return heap_alloc(a[1]);
@@ -627,63 +836,155 @@ H(h_realloc) {
 H(h_memcpy)  { uint8_t *d = g2h(a[0], a[2]), *s = g2h(a[1], a[2]); if (d && s) memmove(d, s, a[2]); return a[0]; }
 H(h_memset)  { uint8_t *d = g2h(a[0], a[2]); if (d) memset(d, (int)a[1], a[2]); return a[0]; }
 H(h_memcmp)  { uint8_t *d = g2h(a[0], a[2]), *s = g2h(a[1], a[2]); return (d && s) ? (uint32_t)memcmp(d, s, a[2]) : 0; }
+H(h_memchr)  { uint8_t *s = g2h(a[0], a[2]); if (!s) return 0; void *r = memchr(s, (int)a[1], a[2]); return r ? a[0] + (uint32_t)((uint8_t *)r - s) : 0; }
 H(h_strlen)  { const uint8_t *s = g2h(a[0], 1); return s ? (uint32_t)strlen((const char *)s) : 0; }
 H(h_strcmp)  { const uint8_t *x = g2h(a[0], 1), *y = g2h(a[1], 1); return (x && y) ? (uint32_t)strcmp((const char *)x, (const char *)y) : 0; }
 H(h_strncmp) { const uint8_t *x = g2h(a[0], 1), *y = g2h(a[1], 1); return (x && y) ? (uint32_t)strncmp((const char *)x, (const char *)y, a[2]) : 0; }
-H(h_strcpy)  { uint8_t *d = g2h(a[0], 1); const uint8_t *s = g2h(a[1], 1); if (d && s) { size_t n = strlen((const char *)s) + 1; uint8_t *d2 = g2h(a[0], n); if (d2) memmove(d2, s, n); } return a[0]; }
+H(h_strcpy)  { const uint8_t *s = g2h(a[1], 1); if (s) { size_t n = strlen((const char *)s) + 1; uint8_t *d = g2h(a[0], n); if (d) memmove(d, s, n); } return a[0]; }
 H(h_strncpy) { uint8_t *d = g2h(a[0], a[2]); const uint8_t *s = g2h(a[1], 1); if (d && s) strncpy((char *)d, (const char *)s, a[2]); return a[0]; }
+H(h_strcat)  {
+    const char *s = (const char *)g2h(a[1], 1), *d0 = (const char *)g2h(a[0], 1);
+    if (s && d0) { size_t dl = strlen(d0), sl = strlen(s); char *d = (char *)g2h(a[0], dl + sl + 1); if (d) memmove(d + dl, s, sl + 1); }
+    return a[0];
+}
+H(h_strncat) {
+    const char *s = (const char *)g2h(a[1], 1), *d0 = (const char *)g2h(a[0], 1);
+    if (s && d0) { size_t dl = strlen(d0), sl = strnlen(s, a[2]); char *d = (char *)g2h(a[0], dl + sl + 1); if (d) { memmove(d + dl, s, sl); d[dl + sl] = 0; } }
+    return a[0];
+}
+H(h_strdup)  { const char *s = (const char *)g2h(a[0], 1); if (!s) return 0; size_t n = strlen(s) + 1; uint32_t p = heap_alloc((uint32_t)n); char *d = (char *)g2h(p, (uint32_t)n); if (d) memcpy(d, s, n); return p; }
 H(h_strchr)  { const uint8_t *s = g2h(a[0], 1); if (!s) return 0; const char *r = strchr((const char *)s, (int)a[1]); return r ? a[0] + (uint32_t)(r - (const char *)s) : 0; }
 H(h_strrchr) { const uint8_t *s = g2h(a[0], 1); if (!s) return 0; const char *r = strrchr((const char *)s, (int)a[1]); return r ? a[0] + (uint32_t)(r - (const char *)s) : 0; }
+H(h_strstr)  { const char *s = (const char *)g2h(a[0], 1), *t = (const char *)g2h(a[1], 1); if (!s || !t) return 0; const char *r = strstr(s, t); return r ? a[0] + (uint32_t)(r - s) : 0; }
+H(h_atoi)    { const char *s = (const char *)g2h(a[0], 1); return s ? (uint32_t)atoi(s) : 0; }
+H(h_strtol)  { const char *s = (const char *)g2h(a[0], 1); if (!s) return 0; char *e; long v = strtol(s, &e, (int)a[2]); if (a[1]) { uint8_t *pp = g2h(a[1], 4); if (pp) wbe32(pp, a[0] + (uint32_t)(e - s)); } return (uint32_t)v; }
+H(h_strtoul) { const char *s = (const char *)g2h(a[0], 1); if (!s) return 0; char *e; unsigned long v = strtoul(s, &e, (int)a[2]); if (a[1]) { uint8_t *pp = g2h(a[1], 4); if (pp) wbe32(pp, a[0] + (uint32_t)(e - s)); } return (uint32_t)v; }
+H(h_strtoq)  { const char *s = (const char *)g2h(a[0], 1); if (!s) return 0; char *e; long long v = strtoll(s, &e, (int)a[2]); if (a[1]) { uint8_t *pp = g2h(a[1], 4); if (pp) wbe32(pp, a[0] + (uint32_t)(e - s)); } g_r4 = (uint32_t)v; g_use_r4 = 1; return (uint32_t)((uint64_t)v >> 32); }
+H(h_strtouq) { const char *s = (const char *)g2h(a[0], 1); if (!s) return 0; char *e; unsigned long long v = strtoull(s, &e, (int)a[2]); if (a[1]) { uint8_t *pp = g2h(a[1], 4); if (pp) wbe32(pp, a[0] + (uint32_t)(e - s)); } g_r4 = (uint32_t)v; g_use_r4 = 1; return (uint32_t)(v >> 32); }
+H(h_tolower) { return a[0] < 128 ? (uint32_t)tolower((int)a[0]) : a[0]; }
+H(h_toupper) { return a[0] < 128 ? (uint32_t)toupper((int)a[0]) : a[0]; }
+H(h_istype)  { return (rune_flags(a[0]) & a[1]) ? 1 : 0; }
+H(h_maskrune){ return rune_flags(a[0]) & a[1]; }
+H(h_runetype){ return rune_flags(a[0]); }
+H(h_rand)    { UNUSED; return (uint32_t)(rand() & 0x7fffffff); }
+H(h_setlocale){ UNUSED; return g_cstr_c; }
+H(h_error)   { UNUSED; return g_errno_addr; }
 H(h_zero)    { UNUSED; return 0; }
 H(h_one)     { UNUSED; return 1; }
 H(h_getenv)  { UNUSED; return 0; }
 H(h_abort)   { UNUSED; g_stop = 1; g_stop_reason = "abort() dipanggil oleh game"; return 0; }
 H(h_exit)    { g_stop = 1; g_stop_reason = "exit() dipanggil oleh game"; LOG("  exit(%d)\n", (int)a[0]); return 0; }
 H(h_new)     { return heap_alloc(a[0]); }
-H(h_log_fmt) { LOG("    fmt=\"%s\"\n", gstr(a[0])); return 0; }
-H(h_log_fmt2){ LOG("    fmt=\"%s\"\n", gstr(a[1])); return 0; }
+
+H(h_snprintf) { const char *f = (const char *)g2h(a[2], 1); if (!f) return 0; VaCtx c = { 0, 3, 0 }; return fmt_to_guest(a[0], a[1], f, &c, 1); }
+H(h_sprintf)  { const char *f = (const char *)g2h(a[1], 1); if (!f) return 0; VaCtx c = { 0, 2, 0 }; return fmt_to_guest(a[0], 0, f, &c, 0); }
+H(h_vsnprintf){ const char *f = (const char *)g2h(a[2], 1); if (!f) return 0; VaCtx c = { 1, 0, a[3] }; return fmt_to_guest(a[0], a[1], f, &c, 1); }
+H(h_printf)   {
+    const char *f = (const char *)g2h(a[0], 1); if (!f) return 0;
+    VaCtx c = { 0, 1, 0 }; char buf[2048]; size_t n = guest_format(buf, sizeof buf, f, &c);
+    LOG("    [printf] %s%s", buf, (n && buf[n < sizeof buf ? n - 1 : 0] == '\n') ? "" : "\n"); return (uint32_t)n;
+}
+H(h_fprintf)  {
+    const char *f = (const char *)g2h(a[1], 1); if (!f) return 0;
+    VaCtx c = { 0, 2, 0 }; char buf[2048]; size_t n = guest_format(buf, sizeof buf, f, &c);
+    LOG("    [fprintf] %s%s", buf, (n && buf[n < sizeof buf ? n - 1 : 0] == '\n') ? "" : "\n"); return (uint32_t)n;
+}
 H(h_puts)    { LOG("    puts: %s\n", gstr(a[0])); return 1; }
-H(h_msgsend) {
-    LOG("    objc_msgSend(self=%08x, sel=\"%s\")\n", a[0], gstr(a[1]));
-    return 0;
+H(h_write)   {
+    if (a[0] == 1 || a[0] == 2) { uint8_t *b = g2h(a[1], a[2]); if (b) LOG("    write(%u): %.*s\n", a[0], (int)a[2], b); }
+    return a[2];
 }
-H(h_nsappmain) {
-    UNUSED;
-    g_stop = 1;
-    g_stop_reason = "MILESTONE 1 TERCAPAI: NSApplicationMain() dipanggil";
-    return 0;
-}
+H(h_fopen)   { LOG("    fopen(\"%s\", \"%s\")\n", gstr(a[0]), gstr(a[1])); return 0; }
+H(h_mkdir)   { const char *p = (const char *)g2h(a[0], 1); if (!p) return 0xffffffffu; int r = mkdir(p, 0755); return (r == 0 || errno == EEXIST) ? 0 : 0xffffffffu; }
+
+H(h_msgsend) { LOG("    objc_msgSend(self=%08x, sel=\"%s\")\n", a[0], gstr(a[1])); return 0; }
+H(h_nsappmain) { UNUSED; g_stop = 1; g_stop_reason = "MILESTONE 1 TERCAPAI: NSApplicationMain() dipanggil"; return 0; }
+
 static uint32_t g_tls_key = 1;
-H(h_key_create) { uint8_t *p = g2h(a[0], 4); if (p) wbe32(p, g_tls_key++); return 0; }
 static uint32_t g_tls[64];
+H(h_key_create) { uint8_t *p = g2h(a[0], 4); if (p) wbe32(p, g_tls_key++); return 0; }
 H(h_getspecific) { return a[0] < 64 ? g_tls[a[0]] : 0; }
 H(h_setspecific) { if (a[0] < 64) g_tls[a[0]] = a[1]; return 0; }
+
+/* keymgr (dipakai runtime C++ GCC di macOS) */
+H(h_km_get)  { return g_keymgr[a[0] & 63]; }
+H(h_km_set)  { g_keymgr[a[0] & 63] = a[1]; return 0; }
+H(h_kmt_get) { return g_keymgr_thr[a[0] & 63]; }
+H(h_kmt_set) { g_keymgr_thr[a[0] & 63] = a[1]; return 0; }
+
+/* dyld */
+H(h_dyld_lookup) {
+    const char *nm = (const char *)g2h(a[0], 1);
+    if (!nm) return 0;
+    uint32_t addr = hle_symbol(nm, 0);
+    uint8_t *p = g2h(a[1], 4);
+    if (p) wbe32(p, addr);
+    LOG("    dyld_func_lookup(\"%s\") -> %08x\n", nm, addr);
+    return 1;
+}
+
+/* Carbon / CoreFoundation secukupnya */
+H(h_getcurproc)  { uint8_t *p = g2h(a[0], 8); if (p) memset(p, 0, 8); return 0; }
+H(h_copyprocname){ uint8_t *p = g2h(a[1], 4); if (p) wbe32(p, g_fake_obj); return 0; }
+H(h_cfs_getc)    { char *b = (char *)g2h(a[1], a[2] ? a[2] : 1); if (!b || a[2] < 6) return 0; memcpy(b, "Luxor", 6); return 1; }
+H(h_fsrefpath)   { char *b = (char *)g2h(a[1], a[2] ? a[2] : 1); if (!b) return 0xffffffffu; snprintf(b, a[2], "%s", g_appdata); return 0; }
+H(h_bundle_main) { UNUSED; return g_fake_obj + 0x10; }
+H(h_bundle_res)  { UNUSED; return g_fake_obj + 0x20; }
+H(h_url_fsrep)   { char *b = (char *)g2h(a[2], a[3] ? a[3] : 1); if (!b) return 0; snprintf(b, a[3], "%s/Contents/Resources", g_app_path); return 1; }
+H(h_prefs_valid) { if (a[2]) { uint8_t *p = g2h(a[2], 1); if (p) *p = 0; } return 0; }
+H(h_gestalt)     { uint8_t *p = g2h(a[1], 4); if (p) wbe32(p, a[0] == 0x73797376u ? 0x1049u : 0u); return 0; }
+H(h_microsec)    { uint8_t *p = g2h(a[0], 8); uint64_t us = (uint64_t)((mono_s() - g_t0) * 1e6); if (p) { wbe32(p, (uint32_t)(us >> 32)); wbe32(p + 4, (uint32_t)us); } return 0; }
+H(h_uptime)      { UNUSED; uint64_t ns = (uint64_t)((mono_s() - g_t0) * 1e9); g_r4 = (uint32_t)ns; g_use_r4 = 1; return (uint32_t)(ns >> 32); }
+H(h_addns)       { uint64_t s = (((uint64_t)a[0] << 32) | a[1]) + (((uint64_t)a[2] << 32) | a[3]); g_r4 = (uint32_t)s; g_use_r4 = 1; return (uint32_t)(s >> 32); }
+H(h_pixw)        { UNUSED; return 640; }
+H(h_pixh)        { UNUSED; return 480; }
+H(h_bpp)         { UNUSED; return 32; }
 
 static const HleDef g_defs[] = {
     {"_malloc", h_malloc}, {"_calloc", h_calloc}, {"_free", h_free}, {"_realloc", h_realloc},
     {"_valloc", h_malloc}, {"_memalign", h_malloc},
-    {"_memcpy", h_memcpy}, {"_memmove", h_memcpy}, {"_memset", h_memset}, {"_memcmp", h_memcmp},
+    {"_memcpy", h_memcpy}, {"_memmove", h_memcpy}, {"_memset", h_memset}, {"_memcmp", h_memcmp}, {"_memchr", h_memchr},
     {"_bcopy", h_zero},
     {"_strlen", h_strlen}, {"_strcmp", h_strcmp}, {"_strncmp", h_strncmp},
-    {"_strcpy", h_strcpy}, {"_strncpy", h_strncpy}, {"_strchr", h_strchr}, {"_strrchr", h_strrchr},
+    {"_strcpy", h_strcpy}, {"_strncpy", h_strncpy}, {"_strcat", h_strcat}, {"_strncat", h_strncat},
+    {"_strdup", h_strdup}, {"_strchr", h_strchr}, {"_strrchr", h_strrchr}, {"_strstr", h_strstr},
+    {"_atoi", h_atoi}, {"_strtol", h_strtol}, {"_strtoul", h_strtoul}, {"_strtoq", h_strtoq}, {"_strtouq", h_strtouq},
+    {"_tolower", h_tolower}, {"_toupper", h_toupper}, {"____tolower", h_tolower}, {"____toupper", h_toupper},
+    {"___istype", h_istype}, {"___maskrune", h_maskrune}, {"____runetype", h_runetype},
+    {"_rand", h_rand}, {"_srand", h_zero}, {"_setlocale", h_setlocale}, {"___error", h_error},
     {"_abort", h_abort}, {"_exit", h_exit}, {"__exit", h_exit},
     {"__Znwm", h_new}, {"__Znam", h_new}, {"__ZdlPv", h_free}, {"__ZdaPv", h_free},
     {"_getenv", h_getenv}, {"_atexit", h_zero}, {"___cxa_atexit", h_zero},
     {"__mach_init_routine", h_zero}, {"__cthread_init_routine", h_zero},
     {"__dyld_register_func_for_add_image", h_zero}, {"__dyld_register_func_for_remove_image", h_zero},
-    {"_getpid", h_one},
+    {"<dyld_lazy_binder>", h_zero}, {"<dyld_func_lookup>", h_dyld_lookup},
+    {"_getpid", h_one}, {"_isatty", h_zero}, {"_chdir", h_zero},
     {"_pthread_self", h_one}, {"_pthread_mutex_init", h_zero}, {"_pthread_mutex_lock", h_zero},
     {"_pthread_mutex_unlock", h_zero}, {"_pthread_mutex_destroy", h_zero},
     {"_pthread_mutexattr_init", h_zero}, {"_pthread_mutexattr_settype", h_zero},
     {"_pthread_mutexattr_destroy", h_zero}, {"_pthread_cond_init", h_zero},
     {"_pthread_key_create", h_key_create}, {"_pthread_getspecific", h_getspecific},
     {"_pthread_setspecific", h_setspecific},
-    {"_printf", h_log_fmt}, {"_fprintf", h_log_fmt2}, {"_sprintf", h_log_fmt2}, {"_snprintf", h_log_fmt},
-    {"_puts", h_puts}, {"_NSLog", h_log_fmt},
-    {"_objc_msgSend", h_msgsend},
-    {"_NSApplicationMain", h_nsappmain},
+    {"__init_keymgr", h_zero}, {"___keymgr_dwarf2_register_sections", h_zero},
+    {"__keymgr_get_and_lock_processwide_ptr", h_km_get}, {"__keymgr_set_and_unlock_processwide_ptr", h_km_set},
+    {"__keymgr_unlock_processwide_ptr", h_zero},
+    {"__keymgr_get_per_thread_data", h_kmt_get}, {"__keymgr_set_per_thread_data", h_kmt_set},
+    {"_printf", h_printf}, {"_fprintf", h_fprintf}, {"_sprintf", h_sprintf}, {"_snprintf", h_snprintf},
+    {"_vsnprintf", h_vsnprintf}, {"_puts", h_puts}, {"_write", h_write}, {"_fopen", h_fopen}, {"_mkdir", h_mkdir},
+    {"_syslog", h_zero}, {"_openlog", h_zero}, {"_closelog", h_zero},
+    {"_objc_msgSend", h_msgsend}, {"_NSApplicationMain", h_nsappmain},
+    {"_FSFindFolder", h_zero}, {"_FSRefMakePath", h_fsrefpath}, {"_GetCurrentProcess", h_getcurproc},
+    {"_CopyProcessName", h_copyprocname}, {"_CFStringGetCString", h_cfs_getc}, {"_CFRelease", h_zero},
+    {"_CFBundleGetMainBundle", h_bundle_main}, {"_CFBundleCopyResourcesDirectoryURL", h_bundle_res},
+    {"_CFURLGetFileSystemRepresentation", h_url_fsrep},
+    {"_CFPreferencesGetAppBooleanValue", h_prefs_valid}, {"_CFPreferencesGetAppIntegerValue", h_prefs_valid},
+    {"_Gestalt", h_gestalt}, {"_Microseconds", h_microsec}, {"_UpTime", h_uptime},
+    {"_AddNanosecondsToAbsolute", h_addns}, {"_MPDelayUntil", h_zero},
+    {"_CGDisplayPixelsWide", h_pixw}, {"_CGDisplayPixelsHigh", h_pixh}, {"_CGDisplayBitsPerPixel", h_bpp},
     {NULL, NULL}
 };
+
+#ifndef DRYRUN
 
 static void hook_code(uc_engine *uc, uint64_t addr, uint32_t size, void *ud)
 {
@@ -703,6 +1004,7 @@ static void hook_code(uc_engine *uc, uint64_t addr, uint32_t size, void *ud)
             LOG("[HLE] %s dari %s\n", h->name, describe(lr));
         uint32_t ret = h->fn ? h->fn(a) : 0;
         W(3, ret);
+        if (g_use_r4) { W(4, g_r4); g_use_r4 = 0; }
         WPC(lr);
         return;
     }
@@ -817,21 +1119,6 @@ static void install_hooks(void)
 }
 #endif /* !DRYRUN */
 
-/* ------------------------------------------------ definisi tabel (dry run) */
-#ifdef DRYRUN
-static const HleDef g_defs[] = {
-    {"_malloc", NULL}, {"_calloc", NULL}, {"_free", NULL}, {"_realloc", NULL}, {"_memcpy", NULL}, {"_memmove", NULL},
-    {"_memset", NULL}, {"_memcmp", NULL}, {"_strlen", NULL}, {"_strcmp", NULL}, {"_strncmp", NULL}, {"_strcpy", NULL},
-    {"_strncpy", NULL}, {"_strchr", NULL}, {"_strrchr", NULL}, {"_abort", NULL}, {"_exit", NULL}, {"__exit", NULL},
-    {"__Znwm", NULL}, {"__Znam", NULL}, {"__ZdlPv", NULL}, {"__ZdaPv", NULL}, {"_getenv", NULL}, {"_atexit", NULL},
-    {"___cxa_atexit", NULL}, {"__mach_init_routine", NULL}, {"__cthread_init_routine", NULL},
-    {"__dyld_register_func_for_add_image", NULL}, {"__dyld_register_func_for_remove_image", NULL},
-    {"_getpid", NULL}, {"_pthread_self", NULL}, {"_pthread_mutex_init", NULL}, {"_pthread_mutex_lock", NULL},
-    {"_pthread_mutex_unlock", NULL}, {"_pthread_mutex_destroy", NULL}, {"_pthread_key_create", NULL},
-    {"_pthread_getspecific", NULL}, {"_pthread_setspecific", NULL}, {"_printf", NULL}, {"_NSLog", NULL},
-    {"_objc_msgSend", NULL}, {"_NSApplicationMain", NULL}, {NULL, NULL}
-};
-#endif
 
 static const HleDef *hle_def_find(const char *name)
 {
@@ -873,6 +1160,15 @@ int main(int argc, char **argv)
     map_region("hle-data", DATA_BASE, DATA_SIZE);
     map_region("hle-trap", TRAP_BASE, TRAP_SIZE);
     wbe32(g2h(TRAP_BASE, 4), 0x4e800020);                      /* slot 0 (sentinel) = blr */
+    hle_state_init();
+    snprintf(g_app_path, sizeof g_app_path, "%s", app);
+    {
+        char cwd[500];
+        if (!getcwd(cwd, sizeof cwd)) snprintf(cwd, sizeof cwd, ".");
+        snprintf(g_appdata, sizeof g_appdata, "%s/appdata", cwd);
+        mkdir(g_appdata, 0755);
+        LOG("appdata: %s\n", g_appdata);
+    }
     map_region("stack", STACK_TOP - STACK_SIZE, STACK_SIZE);
 
     /* muat image: exe lebih dulu (indeks 0), lalu framework */
@@ -883,6 +1179,19 @@ int main(int argc, char **argv)
     LOG("\n== Image termuat: %d, export global: %zu ==\n", g_nimg, g_nexp);
 
     for (int i = 0; i < g_nimg; i++) fixup_image(g_img[i]);
+    /* isi section __DATA,__dyld seperti yang dilakukan dyld asli (crt1 memeriksa ini) */
+    for (int i = 0; i < g_nimg; i++) {
+        Image *im = g_img[i];
+        for (int si = 0; si < im->nsects; si++) {
+            Sect *t = &im->sects[si];
+            if (strcmp(t->seg, "__DATA") || strcmp(t->name, "__dyld") || t->size < 8) continue;
+            uint8_t *p = g2h(t->addr + im->slide, 8);
+            if (!p) continue;
+            wbe32(p, hle_symbol("<dyld_lazy_binder>", 0));
+            wbe32(p + 4, hle_symbol("<dyld_func_lookup>", 0));
+            LOG("  __dyld %s: diisi\n", im->short_name);
+        }
+    }
     for (int i = 0; i < g_nimg; i++) print_image_report(g_img[i]);
     print_hle_summary();
 
