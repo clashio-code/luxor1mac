@@ -582,6 +582,9 @@ static void print_unimplemented(void)
     LOG("\n== Daftar simbol BELUM diimplementasi (fungsi) ==\n");
     for (int i = 0; i < g_nhle; i++)
         if (!g_hle[i].is_data && !g_hle[i].known) LOG("  %s%s\n", g_hle[i].name, g_hle[i].calls ? "  [DIPANGGIL]" : "");
+    LOG("\n== Tabel alamat trap fungsi ==\n");
+    for (int i = 0; i < g_nhle; i++)
+        if (!g_hle[i].is_data) LOG("  %08x %s\n", g_hle[i].addr, g_hle[i].name);
     LOG("\n== Data blob ==\n");
     for (int i = 0; i < g_nhle; i++)
         if (g_hle[i].is_data) LOG("  %s @%08x\n", g_hle[i].name, g_hle[i].addr);
@@ -955,7 +958,7 @@ static const HleDef g_defs[] = {
     {"_abort", h_abort}, {"_exit", h_exit}, {"__exit", h_exit},
     {"__Znwm", h_new}, {"__Znam", h_new}, {"__ZdlPv", h_free}, {"__ZdaPv", h_free},
     {"_getenv", h_getenv}, {"_atexit", h_zero}, {"___cxa_atexit", h_zero},
-    {"__mach_init_routine", h_zero}, {"__cthread_init_routine", h_zero},
+    /* __mach_init_routine / __cthread_init_routine adalah VARIABEL (penunjuk fungsi, isi NULL), bukan fungsi */
     {"__dyld_register_func_for_add_image", h_zero}, {"__dyld_register_func_for_remove_image", h_zero},
     {"<dyld_lazy_binder>", h_zero}, {"<dyld_func_lookup>", h_dyld_lookup},
     {"_getpid", h_one}, {"_isatty", h_zero}, {"_chdir", h_zero},
