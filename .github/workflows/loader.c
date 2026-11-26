@@ -34,17 +34,28 @@ static uc_engine *g_uc;
 
 /* ------------------------------------------------------------------ log */
 static FILE *g_logf;
+static size_t g_logbytes;
+static int g_logcut;
+#define LOG_MAX_BYTES 3000000u      /* log dipotong setelah ~3 MB supaya tidak membengkak */
 static void LOG(const char *fmt, ...)
 {
+    if (g_logcut) return;
     va_list ap;
     va_start(ap, fmt);
-    vprintf(fmt, ap);
+    int n = vprintf(fmt, ap);
     va_end(ap);
     if (g_logf) {
         va_start(ap, fmt);
         vfprintf(g_logf, fmt, ap);
         va_end(ap);
         fflush(g_logf);
+    }
+    if (n > 0) g_logbytes += (size_t)n;
+    if (g_logbytes > LOG_MAX_BYTES) {
+        g_logcut = 1;
+        const char *m = "\n[LOG DIPOTONG: melebihi 3 MB, kemungkinan ada pengulangan]\n";
+        fputs(m, stdout);
+        if (g_logf) { fputs(m, g_logf); fflush(g_logf); }
     }
     fflush(stdout);
 }
@@ -875,8 +886,8 @@ H(h_error)   { UNUSED; return g_errno_addr; }
 H(h_zero)    { UNUSED; return 0; }
 H(h_one)     { UNUSED; return 1; }
 H(h_getenv)  { UNUSED; return 0; }
-H(h_abort)   { UNUSED; g_stop = 1; g_stop_reason = "abort() dipanggil oleh game"; return 0; }
-H(h_exit)    { g_stop = 1; g_stop_reason = "exit() dipanggil oleh game"; LOG("  exit(%d)\n", (int)a[0]); return 0; }
+H(h_abort)   { UNUSED; if (!g_stop) { g_stop = 1; g_stop_reason = "abort() dipanggil oleh game"; } return 0; }
+H(h_exit)    { if (!g_stop) { g_stop = 1; g_stop_reason = "exit() dipanggil oleh game"; } LOG("  exit(%d)\n", (int)a[0]); return 0; }
 H(h_new)     { return heap_alloc(a[0]); }
 
 H(h_snprintf) { const char *f = (const char *)g2h(a[2], 1); if (!f) return 0; VaCtx c = { 0, 3, 0 }; return fmt_to_guest(a[0], a[1], f, &c, 1); }
@@ -901,7 +912,7 @@ H(h_fopen)   { LOG("    fopen(\"%s\", \"%s\")\n", gstr(a[0]), gstr(a[1])); retur
 H(h_mkdir)   { const char *p = (const char *)g2h(a[0], 1); if (!p) return 0xffffffffu; int r = mkdir(p, 0755); return (r == 0 || errno == EEXIST) ? 0 : 0xffffffffu; }
 
 H(h_msgsend) { LOG("    objc_msgSend(self=%08x, sel=\"%s\")\n", a[0], gstr(a[1])); return 0; }
-H(h_nsappmain) { UNUSED; g_stop = 1; g_stop_reason = "MILESTONE 1 TERCAPAI: NSApplicationMain() dipanggil"; return 0; }
+H(h_nsappmain) { UNUSED; if (!g_stop) { g_stop = 1; g_stop_reason = "MILESTONE 1 TERCAPAI: NSApplicationMain() dipanggil"; } return 0; }
 
 static uint32_t g_tls_key = 1;
 static uint32_t g_tls[64];
@@ -919,10 +930,11 @@ H(h_kmt_set) { g_keymgr_thr[a[0] & 63] = a[1]; return 0; }
 H(h_dyld_lookup) {
     const char *nm = (const char *)g2h(a[0], 1);
     if (!nm) return 0;
+    int existed = hle_find(nm) != NULL;
     uint32_t addr = hle_symbol(nm, 0);
     uint8_t *p = g2h(a[1], 4);
     if (p) wbe32(p, addr);
-    LOG("    dyld_func_lookup(\"%s\") -> %08x\n", nm, addr);
+    if (!existed) LOG("    dyld_func_lookup(\"%s\") -> %08x\n", nm, addr);
     return 1;
 }
 
@@ -1009,6 +1021,7 @@ static void hook_code(uc_engine *uc, uint64_t addr, uint32_t size, void *ud)
         W(3, ret);
         if (g_use_r4) { W(4, g_r4); g_use_r4 = 0; }
         WPC(lr);
+        if (g_stop) uc_emu_stop(g_uc);
         return;
     }
     LOG("[HLE] slot %u tanpa entri @%08x\n", idx, (uint32_t)addr);
@@ -1213,6 +1226,7 @@ int main(int argc, char **argv)
     LOG("\nentry exe = %08x (%s)\n", mainimg->entry, describe(mainimg->entry));
 
 #ifdef DRYRUN
+    g_logcut = 0;
     print_unimplemented();
     LOG("\nDRYRUN selesai (emulator tidak dijalankan).\n");
     return 0;
@@ -1260,6 +1274,7 @@ int main(int argc, char **argv)
         LOG("\nhasil run_guest = %d: %s\n", r, g_stop_reason);
     }
 done:
+    g_logcut = 0;
     print_unimplemented();
     LOG("\nSelesai.\n");
     return 0;
