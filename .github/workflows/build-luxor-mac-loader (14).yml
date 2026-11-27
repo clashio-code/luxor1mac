@@ -1411,7 +1411,13 @@ jobs:
               }
               return n;
           }
-          H(h_sscanf)  { const char *in = cs(a[0]), *f = cs(a[1]); VaCtx c = { 0, 2, 0 }; return scan_guest(in, f, &c); }
+          H(h_sscanf)  {
+              const char *in = cs(a[0]), *f = cs(a[1]); VaCtx c = { 0, 2, 0 };
+              uint32_t n = scan_guest(in, f, &c);
+              char k[96]; snprintf(k, sizeof k, "sscanf %.80s", f);
+              if (seen_first(k)) LOG("[sscanf] fmt=\"%s\" in=\"%.60s\" -> %u\n", f, in, n);
+              return n;
+          }
           H(h_vsscanf) { const char *in = cs(a[0]), *f = cs(a[1]); VaCtx c = { 1, 0, a[2] }; return scan_guest(in, f, &c); }
           H(h_sprintf)  { const char *f = (const char *)g2h(a[1], 1); if (!f) return 0; VaCtx c = { 0, 2, 0 }; return fmt_to_guest(a[0], 0, f, &c, 0); }
           H(h_vsnprintf){ const char *f = (const char *)g2h(a[2], 1); if (!f) return 0; VaCtx c = { 1, 0, a[3] }; return fmt_to_guest(a[0], a[1], f, &c, 1); }
@@ -2598,6 +2604,34 @@ jobs:
               uc_emu_stop(g_uc);
           }
 
+          /* ===== diagnosa + pengaman uiGameLevel::fixDValue(int &path, int &node, float &d) =====
+           * Fungsi ini mengulang "d -= jarak(node)" selama d >= jarak.  Kalau d tak hingga / sangat besar,
+           * pengurangan 100.0 tidak mengubah nilai float -> loop abadi.  Nilai d dicatat dan dijepit. */
+          static int sym_find_any(const char *name, uint32_t *addr);
+          static unsigned g_fixd_n, g_fixd_bad;
+          static void hook_fixd(uc_engine *uc, uint64_t addr, uint32_t size, void *ud)
+          {
+              (void)uc; (void)addr; (void)size; (void)ud;
+              uint32_t pp = R(4), pn = R(5), pd = R(6);
+              uint8_t *q = g2h(pd, 4);
+              if (!q) return;
+              uint32_t u = be32(q); float d; memcpy(&d, &u, 4);
+              int path = (int)rd32(pp), node = (int)rd32(pn);
+              g_fixd_n++;
+              int bad = !isfinite(d) || d > 1e6f || d < -1e6f;
+              if (g_fixd_n <= 15 || (bad && g_fixd_bad < 30))
+                  LOG("[fixD] #%u path=%d node=%d d=%g%s  dari %s\n", g_fixd_n, path, node, (double)d, bad ? "  <-- TIDAK WAJAR, dijepit ke 0" : "", describe(RLR()));
+              if (bad) { g_fixd_bad++; float z = 0; memcpy(&u, &z, 4); wbe32(q, u); }
+          }
+          static void install_game_hooks(void)
+          {
+              uint32_t a = 0;
+              if (sym_find_any("__ZNK11uiGameLevel9fixDValueERiS0_Rf", &a)) {
+                  uc_hook h;
+                  uc_err e = uc_hook_add(g_uc, &h, UC_HOOK_CODE, (void *)hook_fixd, NULL, a, a);
+                  LOG("[fixD] hook @%08x: %s\n", a, uc_strerror(e));
+              } else LOG("[fixD] simbol tidak ditemukan\n");
+          }
           static void install_hooks(void)
           {
               uc_hook h1, h2, h3, h4;
@@ -2676,7 +2710,7 @@ jobs:
           #endif
               }
               g_logf = fopen("loader_log.txt", "w");
-              LOG("luxor_mac_loader M1 (probe) r19-longframe\napp: %s\n", app);
+              LOG("luxor_mac_loader M1 (probe) r20-fixd\napp: %s\n", app);
           #ifndef DRYRUN
               signal(SIGABRT, crash_handler);
               signal(SIGSEGV, crash_handler);
@@ -2762,6 +2796,7 @@ jobs:
           #else
               enable_fpu_altivec();
               install_hooks();
+              install_game_hooks();
 
               /* jalankan initializer: dependensi dulu, exe terakhir */
               for (int i = 0; i < g_norder; i++) {
