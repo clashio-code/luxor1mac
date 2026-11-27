@@ -2103,9 +2103,30 @@ jobs:
               *pdx = dx; *pdy = dy;
           }
           static unsigned long g_hle_fetch_calls;
+          static volatile int g_prof_report_req;
           static volatile unsigned long g_hle_calls_total, g_fcmp_total;
           static volatile unsigned long g_fpemu_total;
           static unsigned long g_fpemu_calls_all(void) { return g_fpemu_total; }
+          /* laporan berkala: fungsi tiruan (HLE) yang paling sering dipanggil sejak laporan terakhir */
+          static uint64_t *g_hle_prev;
+          static void hle_top_report(void)
+          {
+              if (!g_hle_prev) g_hle_prev = (uint64_t *)calloc((size_t)g_caphle + 64, sizeof(uint64_t));
+              if (!g_hle_prev) return;
+              int best[8]; uint64_t bv[8]; int nb = 0;
+              for (int i = 0; i < g_nhle && i < g_caphle + 64; i++) {
+                  uint64_t d = g_hle[i].calls - g_hle_prev[i];
+                  g_hle_prev[i] = g_hle[i].calls;
+                  if (!d) continue;
+                  int p = nb < 8 ? nb++ : 7;
+                  if (p == 7 && nb == 8 && d <= bv[7]) continue;
+                  best[p] = i; bv[p] = d;
+                  while (p > 0 && bv[p] > bv[p - 1]) { int ti = best[p]; best[p] = best[p - 1]; best[p - 1] = ti; uint64_t tv = bv[p]; bv[p] = bv[p - 1]; bv[p - 1] = tv; p--; }
+              }
+              char b[600]; int n = 0;
+              for (int i = 0; i < nb && n < 560; i++) n += snprintf(b + n, sizeof b - n, " %s=%llu", g_hle[best[i]].name, (unsigned long long)bv[i]);
+              LOG("[perf]   HLE terbanyak (30 dtk):%s\n", b);
+          }
           static char g_inname[16][64];
           static const char *nm_of(int *fds, int i) { (void)fds; return g_inname[i]; }
           static void *input_thread(void *ud)
@@ -2198,6 +2219,7 @@ jobs:
                                   df / dtv, 100 * (g_t_render - lr) / dtv, 100 * (g_t_present - lp) / dtv,
                                   100 - 100 * (g_t_render - lr + g_t_present - lp) / dtv, g_n_fast - lfa, g_n_affine - laf, g_n_slow - lsl);
                           { static unsigned long lhc, lfc; LOG("[perf]   HLE: %.0f/detik | fcmpu: %.0f/detik\n", (g_hle_calls_total - lhc) / dtv, (g_fcmp_total - lfc) / dtv); lhc = g_hle_calls_total; lfc = g_fcmp_total; }
+                          { static int rep; if (++rep % 6 == 0) { hle_top_report(); g_prof_report_req = 1; } }
                           { static double lo; static unsigned long lfe; { double sp = 100.0 * (dtv - (g_time_off - lo)) / dtv; if (sp < 0) sp = 0; LOG("[perf]   kecepatan game: %.0f%% dari normal | FPU ditangani loader: %lu/detik\n", sp, (unsigned long)((g_fpemu_calls_all() - lfe) / dtv)); lfe = g_fpemu_calls_all(); } lo = g_time_off; }
                           lf = g_curframe; lr = g_t_render; lp = g_t_present; lt = hb_t; lfa = g_n_fast; laf = g_n_affine; lsl = g_n_slow;
                       }
@@ -2538,6 +2560,59 @@ jobs:
           }
 
           /* jalankan emulasi mulai dari pc sampai sentinel / stop / error / timeout */
+          /* ===== profiler sampling (LUXOR_PROFILE=1): tiap ~2 ms emulator dihentikan sebentar, PC dicatat,
+           * lalu dilanjutkan.  Hasil: fungsi game yang paling banyak memakan waktu CPU. ===== */
+          static int g_prof_on;
+          static volatile int g_prof_tick;
+          static uint32_t *g_prof_pc; static unsigned g_prof_n, g_prof_cap = 200000;
+          static void *prof_thread(void *ud)
+          {
+              (void)ud;
+              for (;;) { usleep(2000); if (g_uc) { g_prof_tick = 1; uc_emu_stop(g_uc); } }
+              return NULL;
+          }
+          static void prof_start(void)
+          {
+              const char *e = getenv("LUXOR_PROFILE");
+              if (!e || !atoi(e)) return;
+              g_prof_pc = (uint32_t *)malloc(sizeof(uint32_t) * g_prof_cap);
+              if (!g_prof_pc) return;
+              g_prof_on = 1;
+              pthread_t th; pthread_create(&th, NULL, prof_thread, NULL); pthread_detach(th);
+              LOG("[prof] profiler aktif (sampel tiap 2 ms)\n");
+          }
+          static int cmp_u32(const void *a, const void *b) { uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b; return (x > y) - (x < y); }
+          static void prof_report(void)
+          {
+              if (!g_prof_on || g_prof_n < 50) return;
+              unsigned n = g_prof_n; g_prof_n = 0;
+              /* petakan PC -> alamat awal fungsi (simbol terdekat) */
+              for (unsigned i = 0; i < n; i++) {
+                  uint32_t a = g_prof_pc[i], fs = a;
+                  for (int k = 0; k < g_nimg; k++) {
+                      Image *im = g_img[k];
+                      if (a < im->lo || a >= im->hi) continue;
+                      int lo = 0, hi = im->nsymrec - 1;
+                      while (lo <= hi) { int mid = (lo + hi) / 2; if (im->syms[mid].addr <= a) { fs = im->syms[mid].addr; lo = mid + 1; } else hi = mid - 1; }
+                      break;
+                  }
+                  g_prof_pc[i] = fs;
+              }
+              qsort(g_prof_pc, n, sizeof(uint32_t), cmp_u32);
+              uint32_t top[15]; unsigned tc[15]; int nt = 0;
+              for (unsigned i = 0; i < n;) {
+                  unsigned j = i; while (j < n && g_prof_pc[j] == g_prof_pc[i]) j++;
+                  unsigned c = j - i;
+                  int p = nt < 15 ? nt++ : 14;
+                  if (!(p == 14 && nt == 15 && c <= tc[14])) {
+                      top[p] = g_prof_pc[i]; tc[p] = c;
+                      while (p > 0 && tc[p] > tc[p - 1]) { uint32_t t = top[p]; top[p] = top[p - 1]; top[p - 1] = t; unsigned u = tc[p]; tc[p] = tc[p - 1]; tc[p - 1] = u; p--; }
+                  }
+                  i = j;
+              }
+              LOG("[prof] %u sampel, fungsi game terberat:\n", n);
+              for (int i = 0; i < nt; i++) LOG("[prof]   %5.1f%%  %s\n", 100.0 * tc[i] / n, describe(top[i]));
+          }
           static void enable_fpu_altivec(void);
           static int g_use_count = 0;     /* 1 = cara lama (hitung instruksi, lambat): LUXOR_EMU_COUNT=1 */
           static int run_guest(uint32_t pc, double max_seconds)
@@ -2565,6 +2640,12 @@ jobs:
                       ? uc_emu_start(g_uc, pc, 0xFFFFFFFFull, 5 * 1000000ull, 0)
                       : uc_emu_start(g_uc, pc, 0xFFFFFFFFull, (uint64_t)(left * 1e6), 0);
                   if (g_stop) return g_stop;                      /* 1 = stop permintaan HLE, 2 = sentinel */
+                  if (g_prof_tick) {
+                      g_prof_tick = 0;
+                      uint32_t sp = RPC();
+                      if (g_prof_n < g_prof_cap) g_prof_pc[g_prof_n++] = sp;
+                      if (e == UC_ERR_OK) { pc = sp; if (now_s() - t0 <= max_seconds) continue; }
+                  }
                   if (e == UC_ERR_FETCH_PROT || e == UC_ERR_FETCH_UNMAPPED) {
                       /* mode HLE "fetch": area trap tidak boleh dieksekusi, jadi setiap lompatan ke fungsi
                        * tiruan PASTI berhenti di sini (tidak bergantung pada hook kode Unicorn yang kadang terlewat) */
@@ -2813,6 +2894,7 @@ jobs:
                   g_curframe = f;
                   g_trace = (f < 2);                         /* catat setiap panggilan HLE pada 2 frame pertama */
                   if (f < 3) LOG("frame %d mulai\n", f);
+                  if (g_prof_report_req) { g_prof_report_req = 0; prof_report(); }
                   cursor_step();
                   {   /* batasi langkah waktu game per frame */
                       double now = mono_s();
@@ -3393,7 +3475,7 @@ jobs:
               { const char *e = getenv("LUXOR_DEBUG"); if (e && atoi(e)) g_blocktrace = 1; }
               { const char *e = getenv("LUXOR_EMU_COUNT"); if (e && atoi(e)) g_use_count = 1; }
               g_logf = fopen("loader_log.txt", "w");
-              LOG("luxor_mac_loader M1 (probe) r36-fastemu\napp: %s\n", app);
+              LOG("luxor_mac_loader M1 (probe) r37-prof\napp: %s\n", app);
           #ifndef DRYRUN
               signal(SIGABRT, crash_handler);
               signal(SIGSEGV, crash_handler);
@@ -3489,6 +3571,7 @@ jobs:
               enable_fpu_altivec();
               install_hooks();
               install_fcmp_fix();
+              prof_start();
               fpu_selftest_and_fix();
               install_stfs_fix();
               if (getenv("LUXOR_DEBUG_FIXD")) install_game_hooks();
@@ -3545,14 +3628,14 @@ jobs:
           LOADER_C_EOF
           cat > src/Luxor_Mac.sh <<'LUXOR_SH_EOF'
           #!/bin/sh
-          # Luxor Mac (PowerPC) -> Linux ARM64 | Milestone 1 | peluncur diagnostik v18 (muOS)
+          # Luxor Mac (PowerPC) -> Linux ARM64 | Milestone 1 | peluncur diagnostik v19 (muOS)
           # Skrip ini di ROMS/Ports ; folder "luxor_mac" (berisi luxor_mac_loader dan Luxor_Mac/Luxor.app)
           # dicari otomatis di beberapa lokasi umum.
           DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
           L1="$DIR/luxor_mac_launcher.txt"
 
           {
-            echo "== peluncur v18 mulai: $(date 2>&1)"
+            echo "== peluncur v19 mulai: $(date 2>&1)"
             echo "script : $0"
             echo "DIR    : $DIR"
           } > "$L1" 2>&1
@@ -3609,6 +3692,8 @@ jobs:
           # Kontrol: D-pad/stick = kursor, A = klik kiri, B = klik kanan, L1 = kursor pelan
           # tombol kode 306 = ketik nama (LUXOR_NAME) + Enter, kode 307 = Backspace, R1 = Enter
           export LUXOR_NAME="${LUXOR_NAME:-PLAYER}"
+          # 1 = catat fungsi game yang paling berat (diagnosa kecepatan, sedikit menambah beban)
+          export LUXOR_PROFILE="${LUXOR_PROFILE:-1}"
           # langkah waktu game maks per frame (ms). Kecil = tumbukan akurat tapi game melambat saat fps rendah; 0 = nonaktif
           export LUXOR_MAX_DT_MS="${LUXOR_MAX_DT_MS:-0}"
           # batas waktu darurat (detik); 0 = tanpa batas. Keluar manual: SELECT+START atau tahan MENU 1 detik
