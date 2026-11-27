@@ -2640,11 +2640,9 @@ jobs:
                       ? uc_emu_start(g_uc, pc, 0xFFFFFFFFull, 5 * 1000000ull, 0)
                       : uc_emu_start(g_uc, pc, 0xFFFFFFFFull, (uint64_t)(left * 1e6), 0);
                   if (g_stop) return g_stop;                      /* 1 = stop permintaan HLE, 2 = sentinel */
-                  if (g_prof_tick) {
+                  if (g_prof_tick) {   /* hanya catat; alur normal (pc = RPC()) yang melanjutkan */
                       g_prof_tick = 0;
-                      uint32_t sp = RPC();
-                      if (g_prof_n < g_prof_cap) g_prof_pc[g_prof_n++] = sp;
-                      if (e == UC_ERR_OK) { pc = sp; if (now_s() - t0 <= max_seconds) continue; }
+                      if (g_prof_n < g_prof_cap) g_prof_pc[g_prof_n++] = RPC();
                   }
                   if (e == UC_ERR_FETCH_PROT || e == UC_ERR_FETCH_UNMAPPED) {
                       /* mode HLE "fetch": area trap tidak boleh dieksekusi, jadi setiap lompatan ke fungsi
@@ -3475,7 +3473,7 @@ jobs:
               { const char *e = getenv("LUXOR_DEBUG"); if (e && atoi(e)) g_blocktrace = 1; }
               { const char *e = getenv("LUXOR_EMU_COUNT"); if (e && atoi(e)) g_use_count = 1; }
               g_logf = fopen("loader_log.txt", "w");
-              LOG("luxor_mac_loader M1 (probe) r37-prof\napp: %s\n", app);
+              LOG("luxor_mac_loader M1 (probe) r38-prof2\napp: %s\n", app);
           #ifndef DRYRUN
               signal(SIGABRT, crash_handler);
               signal(SIGSEGV, crash_handler);
@@ -3628,14 +3626,14 @@ jobs:
           LOADER_C_EOF
           cat > src/Luxor_Mac.sh <<'LUXOR_SH_EOF'
           #!/bin/sh
-          # Luxor Mac (PowerPC) -> Linux ARM64 | Milestone 1 | peluncur diagnostik v19 (muOS)
+          # Luxor Mac (PowerPC) -> Linux ARM64 | Milestone 1 | peluncur diagnostik v20 (muOS)
           # Skrip ini di ROMS/Ports ; folder "luxor_mac" (berisi luxor_mac_loader dan Luxor_Mac/Luxor.app)
           # dicari otomatis di beberapa lokasi umum.
           DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
           L1="$DIR/luxor_mac_launcher.txt"
 
           {
-            echo "== peluncur v19 mulai: $(date 2>&1)"
+            echo "== peluncur v20 mulai: $(date 2>&1)"
             echo "script : $0"
             echo "DIR    : $DIR"
           } > "$L1" 2>&1
@@ -3693,7 +3691,7 @@ jobs:
           # tombol kode 306 = ketik nama (LUXOR_NAME) + Enter, kode 307 = Backspace, R1 = Enter
           export LUXOR_NAME="${LUXOR_NAME:-PLAYER}"
           # 1 = catat fungsi game yang paling berat (diagnosa kecepatan, sedikit menambah beban)
-          export LUXOR_PROFILE="${LUXOR_PROFILE:-1}"
+          export LUXOR_PROFILE="${LUXOR_PROFILE:-0}"
           # langkah waktu game maks per frame (ms). Kecil = tumbukan akurat tapi game melambat saat fps rendah; 0 = nonaktif
           export LUXOR_MAX_DT_MS="${LUXOR_MAX_DT_MS:-0}"
           # batas waktu darurat (detik); 0 = tanpa batas. Keluar manual: SELECT+START atau tahan MENU 1 detik
