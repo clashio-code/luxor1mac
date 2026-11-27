@@ -2691,6 +2691,56 @@ jobs:
               (void)uc; (void)addr; (void)size; (void)ud;
               if (g_fixd_n >= 1 && g_gnd_n < 12) { g_gnd_n++; LOG("[fixD]   getNextNodeDistance(path=%d, node=%d) this=%08x paths=%08x\n", (int)R(4), (int)R(5), R(3), rd32(R(3) + 408)); }
           }
+          /* ===== perbaikan bug Unicorn: fcmpu/fcmpo memberi hasil CR yang salah (mis. 84 vs 0 -> LT) =====
+           * Setiap instruksi fcmpu/fcmpo di __text semua image di-hook; loader menghitung perbandingannya
+           * sendiri, menulis field CR + FPSCR[FPCC], lalu melompati instruksi aslinya. */
+          static unsigned g_fcmp_n, g_fcmp_fix;
+          static void hook_fcmp(uc_engine *uc, uint64_t addr, uint32_t size, void *ud)
+          {
+              (void)uc; (void)size; (void)ud;
+              uint32_t w = rd32((uint32_t)addr);
+              int crf = (w >> 23) & 7, fa = (w >> 16) & 31, fb = (w >> 11) & 31;
+              double a = F(fa), b = F(fb);
+              uint32_t c = (isnan(a) || isnan(b)) ? 1 : a < b ? 8 : a > b ? 4 : 2;
+              uint32_t cr = 0;
+              uc_reg_read(g_uc, UC_PPC_REG_CR, &cr);
+              int sh = 28 - 4 * crf;
+              uint32_t old = (cr >> sh) & 15;
+              cr = (cr & ~(15u << sh)) | (c << sh);
+              uc_reg_write(g_uc, UC_PPC_REG_CR, &cr);
+          #ifdef LUXOR_HAVE_FPSCR
+              uint32_t fs = 0; uc_reg_read(g_uc, UC_PPC_REG_FPSCR, &fs);
+              fs = (fs & ~0xF000u) | (c << 12);
+              uc_reg_write(g_uc, UC_PPC_REG_FPSCR, &fs);
+          #endif
+              g_fcmp_n++;
+              if (old != c && g_fcmp_fix++ < 5)
+                  LOG("[fcmp] %s: f%d=%g f%d=%g cr%d emulator=%x -> benar=%x\n", describe((uint32_t)addr), fa, a, fb, b, crf, old, c);
+              WPC((uint32_t)addr + 4);
+          }
+          static void install_fcmp_fix(void)
+          {
+              const char *e = getenv("LUXOR_FCMP_FIX");
+              if (e && atoi(e) == 0) { LOG("[fcmp] perbaikan dimatikan (LUXOR_FCMP_FIX=0)\n"); return; }
+              unsigned total = 0;
+              for (int i = 0; i < g_nimg; i++) {
+                  Image *im = g_img[i];
+                  for (int s = 0; s < im->nsects; s++) {
+                      Sect *t = &im->sects[s];
+                      if (strcmp(t->name, "__text")) continue;
+                      uint32_t base = t->addr + im->slide;
+                      for (uint32_t o = 0; o + 4 <= t->size; o += 4) {
+                          uint32_t w = rd32(base + o);
+                          if ((w >> 26) != 63 || (w & 0x600001u)) continue;
+                          uint32_t xo = (w >> 1) & 0x3ff;
+                          if (xo != 0 && xo != 32) continue;
+                          uc_hook h;
+                          if (uc_hook_add(g_uc, &h, UC_HOOK_CODE, (void *)hook_fcmp, NULL, base + o, base + o) == UC_ERR_OK) total++;
+                      }
+                  }
+              }
+              LOG("[fcmp] %u instruksi fcmpu/fcmpo ditangani loader\n", total);
+          }
           static void install_game_hooks(void)
           {
               uint32_t a = 0;
@@ -2785,7 +2835,7 @@ jobs:
           #endif
               }
               g_logf = fopen("loader_log.txt", "w");
-              LOG("luxor_mac_loader M1 (probe) r22-fcmp\napp: %s\n", app);
+              LOG("luxor_mac_loader M1 (probe) r23-fcmpfix\napp: %s\n", app);
           #ifndef DRYRUN
               signal(SIGABRT, crash_handler);
               signal(SIGSEGV, crash_handler);
@@ -2871,7 +2921,8 @@ jobs:
           #else
               enable_fpu_altivec();
               install_hooks();
-              install_game_hooks();
+              install_fcmp_fix();
+              if (getenv("LUXOR_DEBUG_FIXD")) install_game_hooks();
 
               /* jalankan initializer: dependensi dulu, exe terakhir */
               for (int i = 0; i < g_norder; i++) {
