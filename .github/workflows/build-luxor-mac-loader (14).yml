@@ -1578,6 +1578,8 @@ jobs:
           static int g_nvb;
           static uint32_t g_prim;
 
+          static double g_t_render, g_t_present;   /* detik kumulatif: rasterisasi & salin ke layar */
+          static unsigned g_n_fast, g_n_affine, g_n_slow;
           static void fbdev_open(void);
           static int g_native_res = 1;          /* 1 = render langsung di resolusi layar (lebih cepat) */
           static int g_fb_w0, g_fb_h0;          /* ukuran layar fisik bila tersedia */
@@ -1779,6 +1781,69 @@ jobs:
               }
               return 1;
           }
+          /* jalur cepat kedua: quad jajaran genjang (sprite diputar/diskalakan, mis. bola & partikel demo).
+           * Pemetaan layar -> tekstur affine, dihitung inkremental per piksel. */
+          static int affine_quad(GTex *tx, int rect)
+          {
+              if (g_nvb != 4 || (g_prim != 5 && g_prim != 7 && g_prim != 6 && g_prim != 9)) return 0;
+              GV *v = g_vb;
+              for (int i = 1; i < 4; i++) for (int k = 0; k < 4; k++) if (v[i].c[k] != v[0].c[k]) return 0;
+              int blend = g_en_blend;
+              if (blend && !(g_bsrc == 0x302 && g_bdst == 0x303) && !(g_bsrc == 1 && g_bdst == 0) && !(g_bsrc == 0x302 && g_bdst == 1) && !(g_bsrc == 1 && g_bdst == 0x303)) return 0;
+              /* urutan sudut: strip = 0,1,3,2 ; quad/fan = 0,1,2,3 */
+              const GV *P0 = &v[0], *P1 = &v[1], *P2, *P3;
+              if (g_prim == 5) { P2 = &v[3]; P3 = &v[2]; } else { P2 = &v[2]; P3 = &v[3]; }
+              /* harus jajaran genjang: P0+P2 == P1+P3 (posisi & uv) */
+              if (fabsf(P0->x + P2->x - P1->x - P3->x) > 0.05f || fabsf(P0->y + P2->y - P1->y - P3->y) > 0.05f) return 0;
+              if (fabsf(P0->u + P2->u - P1->u - P3->u) > 1e-4f || fabsf(P0->v + P2->v - P1->v - P3->v) > 1e-4f) return 0;
+              float ax = P1->x - P0->x, ay = P1->y - P0->y, bx = P3->x - P0->x, by = P3->y - P0->y;
+              float det = ax * by - ay * bx;
+              if (fabsf(det) < 1e-3f) return 1;
+              /* s,t in [0,1]: titik = P0 + s*a + t*b */
+              float ia = by / det, ib = -bx / det, ic = -ay / det, id = ax / det;
+              int tw = tx && tx->px ? tx->w : 1, th = tx && tx->px ? tx->h : 1;
+              float su = rect ? 1.0f : (float)tw, sv = rect ? 1.0f : (float)th;
+              float du_s = (P1->u - P0->u) * su, du_t = (P3->u - P0->u) * su, dv_s = (P1->v - P0->v) * sv, dv_t = (P3->v - P0->v) * sv;
+              float mnx = fminf(fminf(P0->x, P1->x), fminf(P2->x, P3->x)), mxx = fmaxf(fmaxf(P0->x, P1->x), fmaxf(P2->x, P3->x));
+              float mny = fminf(fminf(P0->y, P1->y), fminf(P2->y, P3->y)), mxy = fmaxf(fmaxf(P0->y, P1->y), fmaxf(P2->y, P3->y));
+              int x0 = (int)floorf(mnx), x1 = (int)ceilf(mxx), y0 = (int)floorf(mny), y1 = (int)ceilf(mxy);
+              if (x0 < 0) x0 = 0;
+              if (y0 < 0) y0 = 0;
+              if (x1 > g_scr_w) x1 = g_scr_w;
+              if (y1 > g_scr_h) y1 = g_scr_h;
+              if (x0 >= x1 || y0 >= y1) return 1;
+              int cr = (int)(v[0].c[0] * 255 + 0.5f), cg = (int)(v[0].c[1] * 255 + 0.5f), cb = (int)(v[0].c[2] * 255 + 0.5f), ca = (int)(v[0].c[3] * 255 + 0.5f);
+              int white = cr == 255 && cg == 255 && cb == 255 && ca == 255;
+              for (int y = y0; y < y1; y++) {
+                  float py = y + 0.5f - P0->y, px = x0 + 0.5f - P0->x;
+                  float s = ia * px + ib * py, t = ic * px + id * py;
+                  uint32_t *d = g_fb + (size_t)y * g_scr_w;
+                  for (int x = x0; x < x1; x++, s += ia, t += ic) {
+                      if (s < 0 || s >= 1 || t < 0 || t >= 1) continue;
+                      uint32_t sp = 0xffffffffu;
+                      if (tx && tx->px) {
+                          int iu = (int)(P0->u * su + s * du_s + t * du_t), iv = (int)(P0->v * sv + s * dv_s + t * dv_t);
+                          if (iu < 0) iu = 0;
+                          if (iu >= tw) iu = tw - 1;
+                          if (iv < 0) iv = 0;
+                          if (iv >= th) iv = th - 1;
+                          sp = tx->px[(size_t)iv * tw + iu];
+                      }
+                      uint32_t sa = sp >> 24, sr = (sp >> 16) & 255, sg = (sp >> 8) & 255, sb = sp & 255;
+                      if (!white) { sr = sr * cr / 255; sg = sg * cg / 255; sb = sb * cb / 255; sa = sa * ca / 255; }
+                      if (!blend || (g_bsrc == 1 && g_bdst == 0)) { d[x] = (sa << 24) | (sr << 16) | (sg << 8) | sb; continue; }
+                      uint32_t p = d[x], dr = (p >> 16) & 255, dg = (p >> 8) & 255, db = p & 255;
+                      uint32_t fs = (g_bsrc == 1) ? 255 : sa, fd = (g_bdst == 1) ? 255 : 255 - sa;
+                      if (fs == 0 && fd == 255) continue;
+                      uint32_t r = (sr * fs + dr * fd) / 255, g = (sg * fs + dg * fd) / 255, b = (sb * fs + db * fd) / 255;
+                      if (r > 255) r = 255;
+                      if (g > 255) g = 255;
+                      if (b > 255) b = 255;
+                      d[x] = 0xff000000u | (r << 16) | (g << 8) | b;
+                  }
+              }
+              return 1;
+          }
           static void gl_flush_prim(void)
           {
               fb_ensure();
@@ -1787,7 +1852,10 @@ jobs:
               if (g_en_texrect && g_boundrect && g_boundrect < GTEX_MAX) { tx = &g_tex[g_boundrect]; rect = 1; }
               else if (g_en_tex2d && g_bound2d && g_bound2d < GTEX_MAX) tx = &g_tex[g_bound2d];
               int n = g_nvb;
-              if (fast_quad(tx, rect)) return;
+              double rt0 = mono_s();
+              if (fast_quad(tx, rect)) { g_n_fast++; g_t_render += mono_s() - rt0; return; }
+              if (affine_quad(tx, rect)) { g_n_affine++; g_t_render += mono_s() - rt0; return; }
+              g_n_slow++;
               switch (g_prim) {
               case 4: for (int i = 0; i + 2 < n; i += 3) raster_tri(&g_vb[i], &g_vb[i + 1], &g_vb[i + 2], tx, rect); break;      /* TRIANGLES */
               case 5: for (int i = 0; i + 2 < n; i++) raster_tri(&g_vb[i], &g_vb[i + 1], &g_vb[i + 2], tx, rect); break;         /* TRIANGLE_STRIP */
@@ -1796,6 +1864,7 @@ jobs:
                                                            raster_tri(&g_vb[i], &g_vb[i + 2], &g_vb[i + 3], tx, rect); } break;
               default: break;   /* titik / garis diabaikan dulu */
               }
+              g_t_render += mono_s() - rt0;
           }
           static void gl_vertex(float x, float y)
           {
@@ -2029,6 +2098,15 @@ jobs:
                       hb_t = mono_s();
                       unsigned bp = g_blkpos;
                       char rb[160]; ram_info(rb, sizeof rb);
+                      {
+                          static int lf; static double lr, lp, lt; static unsigned lfa, laf, lsl;
+                          double dtv = hb_t - lt; int df = g_curframe - lf;
+                          if (lt > 0 && dtv > 0)
+                              LOG("[perf] %.1f fps | render %.0f%% | ke-layar %.0f%% | emulasi+lain %.0f%% | sprite cepat=%u putar=%u lambat=%u\n",
+                                  df / dtv, 100 * (g_t_render - lr) / dtv, 100 * (g_t_present - lp) / dtv,
+                                  100 - 100 * (g_t_render - lr + g_t_present - lp) / dtv, g_n_fast - lfa, g_n_affine - laf, g_n_slow - lsl);
+                          lf = g_curframe; lr = g_t_render; lp = g_t_present; lt = hb_t; lfa = g_n_fast; laf = g_n_affine; lsl = g_n_slow;
+                      }
                       LOG("[hb] t=%.0fs frame=%d jalan=%s slice=%u HLE=%s blok=%s | %s\n", hb_t - t0, g_curframe,
                           g_in_thr < 0 ? "utama" : "thread", g_slices, g_lasthle ? g_lasthle : "-",
                           describe(g_lastblk[(bp - 1) & 63]), rb);
@@ -2138,7 +2216,7 @@ jobs:
               g_flushn++;
               unsigned n = g_flushn;
               cursor_draw();
-              fbdev_present();
+              { double pt0 = mono_s(); fbdev_present(); g_t_present += mono_s() - pt0; }
               if (g_shot_dir[0] && (n <= 3 || n == 20 || n == 300 || n % 1800 == 0)) {
                   char p[800]; snprintf(p, sizeof p, "%s/frame_%04u.bmp", g_shot_dir, n); save_bmp(p);
               }
@@ -2909,7 +2987,7 @@ jobs:
               }
               { const char *e = getenv("LUXOR_DEBUG"); if (e && atoi(e)) g_blocktrace = 1; }
               g_logf = fopen("loader_log.txt", "w");
-              LOG("luxor_mac_loader M1 (probe) r24-speed\napp: %s\n", app);
+              LOG("luxor_mac_loader M1 (probe) r25-perf\napp: %s\n", app);
           #ifndef DRYRUN
               signal(SIGABRT, crash_handler);
               signal(SIGSEGV, crash_handler);
