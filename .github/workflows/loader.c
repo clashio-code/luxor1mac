@@ -25,6 +25,7 @@
 #include <unistd.h>
 #include <ctype.h>
 #include <math.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 
@@ -621,6 +622,12 @@ static uint32_t heap_size(uint32_t a)
 }
 
 /* ============================================================ EMULASI */
+/* diagnostik crash: jejak blok guest terakhir + HLE terakhir */
+static volatile uint32_t g_lastblk[64];
+static volatile unsigned g_blkpos;
+static const char *volatile g_lasthle;
+static volatile int g_curframe = -1;
+static int g_blocktrace = 1;
 static int g_stop;
 static const char *g_stop_reason = "";
 static int g_trace = 0;
@@ -1093,6 +1100,7 @@ static void print_call_stats(void)
     int idx[1024], n = 0;
     for (int i = 0; i < g_nhle && n < 1024; i++) if (g_hle[i].calls) idx[n++] = i;
     qsort(idx, n, sizeof(int), cmp_calls);
+    LOG("\nheap guest terpakai: %u KB dari %u KB\n", (unsigned)((g_heap_ptr - HEAP_BASE) / 1024), (unsigned)(HEAP_SIZE / 1024));
     LOG("\n== Statistik panggilan HLE (terbanyak) ==\n");
     for (int i = 0; i < n && i < 80; i++)
         LOG("  %8llu  %s%s\n", (unsigned long long)g_hle[idx[i]].calls, g_hle[idx[i]].name, g_hle[idx[i]].known ? "" : "  [generik]");
@@ -1381,6 +1389,31 @@ static const HleDef g_defs[] = {
 
 #ifndef DRYRUN
 
+static void hook_block(uc_engine *uc, uint64_t address, uint32_t size, void *ud)
+{
+    (void)uc; (void)size; (void)ud;
+    g_lastblk[g_blkpos++ & 63] = (uint32_t)address;
+}
+
+static void crash_handler(int sig)
+{
+    char buf[2600];
+    int n = 0;
+    n += snprintf(buf + n, sizeof buf - n, "\n!! SINYAL %d (%s) pada proses loader\n", sig,
+                  sig == SIGABRT ? "abort" : sig == SIGSEGV ? "segfault" : sig == SIGBUS ? "bus error" : "lain");
+    n += snprintf(buf + n, sizeof buf - n, "   frame=%d  HLE terakhir=%s  heap terpakai=%u KB\n",
+                  g_curframe, g_lasthle ? g_lasthle : "-", (unsigned)((g_heap_ptr - HEAP_BASE) / 1024));
+    n += snprintf(buf + n, sizeof buf - n, "   blok guest terakhir (terbaru dulu):\n");
+    unsigned pos = g_blkpos;
+    for (int i = 0; i < 20 && n < (int)sizeof buf - 240; i++) {
+        uint32_t a = g_lastblk[(pos - 1 - (unsigned)i) & 63];
+        n += snprintf(buf + n, sizeof buf - n, "     %s\n", describe(a));
+    }
+    if (g_logf) { fwrite(buf, 1, (size_t)n, g_logf); fflush(g_logf); }
+    if (write(1, buf, (size_t)n) < 0) { /* abaikan */ }
+    _exit(128 + sig);
+}
+
 static void hook_code(uc_engine *uc, uint64_t addr, uint32_t size, void *ud)
 {
     (void)uc; (void)size; (void)ud;
@@ -1391,6 +1424,7 @@ static void hook_code(uc_engine *uc, uint64_t addr, uint32_t size, void *ud)
         Hle *h = &g_hle[i];
         if (h->is_data || h->addr != (uint32_t)addr) continue;
         h->calls++;
+        g_lasthle = h->name;
         uint32_t a[8];
         for (int k = 0; k < 8; k++) a[k] = R(3 + k);
         if (!h->fn && h->calls <= 3)
@@ -1495,6 +1529,9 @@ static void stage2(int frames)
     LOG("timer: target=%08x selector=\"%s\" imp=%08x\n", tgt, cs(sel), loop);
     if (!loop) { LOG("tidak ada IMP untuk selector timer\n"); return; }
     for (int f = 0; f < frames; f++) {
+        g_curframe = f;
+        g_trace = (f < 2);                         /* catat setiap panggilan HLE pada 2 frame pertama */
+        if (f < 3) LOG("frame %d mulai\n", f);
         r = call_guest_args(loop, tgt, sel, 0, 20.0);
         if (r != 2) { LOG("frame %d berhenti, kode=%d (%s)\n", f, r, g_stop_reason); break; }
         if (f < 3 || f % 30 == 0) LOG("frame %d selesai\n", f);
@@ -1558,10 +1595,11 @@ static void enable_fpu_altivec(void)
 
 static void install_hooks(void)
 {
-    uc_hook h1, h2;
+    uc_hook h1, h2, h3;
     uc_hook_add(g_uc, &h1, UC_HOOK_CODE, (void *)hook_code, NULL, TRAP_BASE, TRAP_BASE + TRAP_SIZE - 1);
     uc_hook_add(g_uc, &h2, UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED | UC_HOOK_MEM_FETCH_UNMAPPED,
                 (void *)hook_unmapped, NULL, 1, 0);
+    if (g_blocktrace) uc_hook_add(g_uc, &h3, UC_HOOK_BLOCK, (void *)hook_block, NULL, 1, 0);
 }
 #endif /* !DRYRUN */
 
@@ -1590,10 +1628,18 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--tcg-mb") && i + 1 < argc) g_tcg_mb = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) g_frames = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--no-boot")) g_noboot = 1;
+        else if (!strcmp(argv[i], "--fast")) g_blocktrace = 0;
 #endif
     }
     g_logf = fopen("loader_log.txt", "w");
     LOG("luxor_mac_loader M1 (probe)\napp: %s\n", app);
+#ifndef DRYRUN
+    signal(SIGABRT, crash_handler);
+    signal(SIGSEGV, crash_handler);
+    signal(SIGBUS, crash_handler);
+    signal(SIGFPE, crash_handler);
+    signal(SIGILL, crash_handler);
+#endif
 
 #ifndef DRYRUN
     probe_rwx();
