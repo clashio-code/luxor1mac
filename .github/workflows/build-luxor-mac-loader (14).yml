@@ -2654,14 +2654,35 @@ jobs:
           #ifdef LUXOR_HAVE_CR
               uc_reg_read(g_uc, UC_PPC_REG_CR, &cr);
           #endif
-              if (g_fixd_iter <= 6 && g_fixd_n <= 3)
-                  LOG("[fixD]   loop2 it=%u node=%d d=%g jarak=%g cr=%08x\n", g_fixd_iter, (int)rd32(pn), (double)d, dist, cr);
+              static unsigned l2log;
+              if (g_fixd_iter <= 4 && l2log < 12) {
+                  l2log++;
+                  LOG("[fixD]   loop2 it=%u node=%d d=%g jarak=%g cr=%08x konst@38a08=%08x\n", g_fixd_iter, (int)rd32(pn), (double)d, dist, cr, rd32(0x38a08));
+              }
               if (g_fixd_iter > 2000) {                       /* pengaman: paksa keluar dari loop */
-                  if (g_fixd_cut++ < 10) LOG("[fixD]   loop2 >2000 putaran (node=%d d=%g jarak=%g) -> dipaksa keluar\n", (int)rd32(pn), (double)d, dist);
+                  if (g_fixd_cut++ < 3) LOG("[fixD]   loop2 >2000 putaran (node=%d d=%g jarak=%g) -> dipaksa keluar\n", (int)rd32(pn), (double)d, dist);
                   float z = 0; memcpy(&u, &z, 4); wbe32(q, u);
                   SF(1, 0.0);
                   g_fixd_iter = 0;
               }
+          }
+          /* tepat setelah fcmpu cr7,f0,f13 (alamat fixDValue+0xa8): bandingkan hasil emulator dengan perhitungan host */
+          static void hook_fixd_cmp(uc_engine *uc, uint64_t addr, uint32_t size, void *ud)
+          {
+              (void)uc; (void)addr; (void)size; (void)ud;
+              static unsigned n;
+              if (n >= 12) return;
+              n++;
+              double f0 = F(0), f13 = F(13);
+              uint32_t cr = 0;
+          #ifdef LUXOR_HAVE_CR
+              uc_reg_read(g_uc, UC_PPC_REG_CR, &cr);
+          #endif
+              unsigned c7 = cr & 15;
+              unsigned want = f0 < f13 ? 8 : f0 > f13 ? 4 : f0 == f13 ? 2 : 1;
+              uint64_t r0, r13; memcpy(&r0, &f0, 8); memcpy(&r13, &f13, 8);
+              LOG("[fixD]   fcmpu f0=%g (%016llx) f13=%g (%016llx) -> cr7=%x, seharusnya %x %s\n", f0, (unsigned long long)r0, f13,
+                  (unsigned long long)r13, c7, want, c7 == want ? "OK" : "<-- SALAH");
           }
           /* catat argumen getNextNodeDistance(path, node) untuk beberapa panggilan pertama */
           static unsigned g_gnd_n;
@@ -2679,6 +2700,8 @@ jobs:
                   LOG("[fixD] hook @%08x: %s\n", a, uc_strerror(e));
                   uc_hook h2; e = uc_hook_add(g_uc, &h2, UC_HOOK_CODE, (void *)hook_fixd_loop2, NULL, a + 0x94, a + 0x94);
                   LOG("[fixD] hook loop2 @%08x: %s (insn %08x)\n", a + 0x94, uc_strerror(e), rd32(a + 0x94));
+                  uc_hook h4; e = uc_hook_add(g_uc, &h4, UC_HOOK_CODE, (void *)hook_fixd_cmp, NULL, a + 0xa8, a + 0xa8);
+                  LOG("[fixD] hook cmp @%08x: %s (insn sebelumnya %08x)\n", a + 0xa8, uc_strerror(e), rd32(a + 0xa4));
               } else LOG("[fixD] simbol tidak ditemukan\n");
               if (sym_find_any("__ZNK11uiGameLevel19getNextNodeDistanceEii", &a)) {
                   uc_hook h3; uc_hook_add(g_uc, &h3, UC_HOOK_CODE, (void *)hook_gnd, NULL, a, a);
@@ -2762,7 +2785,7 @@ jobs:
           #endif
               }
               g_logf = fopen("loader_log.txt", "w");
-              LOG("luxor_mac_loader M1 (probe) r21-fixd2\napp: %s\n", app);
+              LOG("luxor_mac_loader M1 (probe) r22-fcmp\napp: %s\n", app);
           #ifndef DRYRUN
               signal(SIGABRT, crash_handler);
               signal(SIGSEGV, crash_handler);
