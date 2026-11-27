@@ -509,7 +509,7 @@ jobs:
                   if (g_trap_slots * 16 >= TRAP_SIZE) { LOG("FATAL: trap slot habis\n"); exit(2); }
                   h->addr = TRAP_BASE + g_trap_slots++ * 16;
                   uint8_t *s = g2h(h->addr, 16);
-                  if (s) { wbe32(s, 0x4e800020); }                       /* blr */
+                  if (s) { wbe32(s, 0x44000002); wbe32(s + 4, 0x4e800020); }   /* sc ; blr  (sc = cadangan bila hook kode terlewat) */
               }
               return h->addr;
           }
@@ -2781,11 +2781,23 @@ jobs:
           }
 
           /* exception CPU guest (FP unavailable, program, alignment, dll) dicatat, bukan diam-diam abort */
+          static unsigned long g_hle_sc_calls;
           static void hook_intr(uc_engine *uc, uint32_t intno, void *ud)
           {
               (void)uc; (void)ud;
               static int n;
               uint32_t pc = RPC();
+              /* cadangan HLE: hook kode di slot trap terlewat -> instruksi 'sc' di slot tereksekusi */
+              {
+                  uint32_t sp = 0;
+                  if (pc >= TRAP_BASE && pc < TRAP_BASE + TRAP_SIZE && rd32(pc) == 0x44000002u) sp = pc;
+                  else if (pc - 4 >= TRAP_BASE && pc - 4 < TRAP_BASE + TRAP_SIZE && rd32(pc - 4) == 0x44000002u) sp = pc - 4;
+                  if (sp) {
+                      if (g_hle_sc_calls++ < 5) LOG("[hle] hook terlewat di %08x (%s) -> dipanggil lewat sc\n", sp, describe(sp));
+                      hook_code(g_uc, sp, 4, NULL);
+                      return;
+                  }
+              }
               if (n++ < 20)
                   LOG("!! exception guest intno=%u di %s (insn %08x)  HLE terakhir=%s\n",
                       intno, describe(pc), rd32(pc), g_lasthle ? g_lasthle : "-");
@@ -3012,7 +3024,7 @@ jobs:
               }
               { const char *e = getenv("LUXOR_DEBUG"); if (e && atoi(e)) g_blocktrace = 1; }
               g_logf = fopen("loader_log.txt", "w");
-              LOG("luxor_mac_loader M1 (probe) r27-hlefetch\napp: %s\n", app);
+              LOG("luxor_mac_loader M1 (probe) r28-hlesc\napp: %s\n", app);
           #ifndef DRYRUN
               signal(SIGABRT, crash_handler);
               signal(SIGSEGV, crash_handler);
@@ -3040,10 +3052,10 @@ jobs:
           #ifndef DRYRUN
               {
                   const char *m = getenv("LUXOR_HLE_MODE");
-                  if (!m || strcmp(m, "hook")) {
+                  if (m && !strcmp(m, "fetch")) {
                       uc_err pe = uc_mem_protect(g_uc, TRAP_BASE, TRAP_SIZE, UC_PROT_READ | UC_PROT_WRITE);
                       LOG("HLE mode: fetch (area trap non-exec) -> %s\n", uc_strerror(pe));
-                  } else LOG("HLE mode: hook (lama)\n");
+                  } else LOG("HLE mode: hook + cadangan 'sc' (default)\n");
               }
           #endif
               hle_state_init();
