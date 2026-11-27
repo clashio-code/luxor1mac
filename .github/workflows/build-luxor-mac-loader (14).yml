@@ -1871,7 +1871,8 @@ jobs:
 
           /* pthread_create: belum ada thread guest sungguhan.  Thread dicatat, lalu dijalankan sampai selesai
            * di antara frame (lihat stage2).  Cukup untuk thread "loading" Luxor (gameMenuState::_update_init). */
-          typedef struct { uint32_t fn, arg, tid; int done, started; uint32_t sp; void *ctx; double used; } GThread;
+          typedef struct { uint32_t fn, arg, tid; int done, started; uint32_t sp; void *ctx; double used;
+                           uint32_t gpr[32], pc, lr, ctr, xer, cr, msr; uint64_t fpr[32]; } GThread;
           static GThread g_thr[32];
           static int g_nthr;
           H(h_pthread_create) {
@@ -2217,6 +2218,38 @@ jobs:
 
           /* ===== thread guest kooperatif: tiap frame, setiap thread jalan sebentar (time-slice) lalu
            * register CPU-nya disimpan (uc_context), jadi layar tetap ter-update selama loading. ===== */
+          /* simpan/pulihkan register secara eksplisit (uc_context saja ternyata tidak cukup untuk PPC) */
+          static void regs_save(GThread *t)
+          {
+              for (int i = 0; i < 32; i++) uc_reg_read(g_uc, UC_PPC_REG_0 + i, &t->gpr[i]);
+              uc_reg_read(g_uc, UC_PPC_REG_PC, &t->pc);
+              uc_reg_read(g_uc, UC_PPC_REG_LR, &t->lr);
+              uc_reg_read(g_uc, UC_PPC_REG_CTR, &t->ctr);
+              uc_reg_read(g_uc, UC_PPC_REG_XER, &t->xer);
+              uc_reg_read(g_uc, UC_PPC_REG_MSR, &t->msr);
+          #ifdef LUXOR_HAVE_CR
+              uc_reg_read(g_uc, UC_PPC_REG_CR, &t->cr);
+          #endif
+          #ifdef LUXOR_HAVE_FPR
+              for (int i = 0; i < 32; i++) uc_reg_read(g_uc, UC_PPC_REG_FPR0 + i, &t->fpr[i]);
+          #endif
+          }
+          static void regs_load(GThread *t)
+          {
+              for (int i = 0; i < 32; i++) uc_reg_write(g_uc, UC_PPC_REG_0 + i, &t->gpr[i]);
+              uc_reg_write(g_uc, UC_PPC_REG_LR, &t->lr);
+              uc_reg_write(g_uc, UC_PPC_REG_CTR, &t->ctr);
+              uc_reg_write(g_uc, UC_PPC_REG_XER, &t->xer);
+              uc_reg_write(g_uc, UC_PPC_REG_MSR, &t->msr);
+          #ifdef LUXOR_HAVE_CR
+              uc_reg_write(g_uc, UC_PPC_REG_CR, &t->cr);
+          #endif
+          #ifdef LUXOR_HAVE_FPR
+              for (int i = 0; i < 32; i++) uc_reg_write(g_uc, UC_PPC_REG_FPR0 + i, &t->fpr[i]);
+          #endif
+              uc_reg_write(g_uc, UC_PPC_REG_PC, &t->pc);
+          }
+          static int g_thr_sync = 1;     /* 1 = thread dijalankan sampai selesai sekaligus (default); 0 = bergantian */
           static double g_thr_ms = 25.0;
           static void thread_slice(GThread *t, double ms)
           {
@@ -2232,7 +2265,18 @@ jobs:
                   LOG("[thread] mulai tid %x fn=%s sp=%08x\n", t->tid, describe(pc), t->sp);
               } else {
                   uc_context_restore(g_uc, (uc_context *)t->ctx);
-                  pc = RPC();
+                  regs_load(t);
+                  pc = t->pc;
+              }
+              if (g_thr_sync) {
+                  LOG("[thread] tid %x dijalankan sampai selesai (mode sync)\n", t->tid);
+                  g_in_thr = (int)t->tid; g_slices++;
+                  int r = run_guest(pc, 180.0);
+                  g_in_thr = -1;
+                  t->done = 1;
+                  LOG("[thread] tid %x selesai, kode=%d (%s)\n", t->tid, r, r == 2 ? "normal" : g_stop_reason);
+                  g_stop = 0;
+                  return;
               }
               int tr0 = g_trace; g_trace = 0;
               g_stop = 0;
@@ -2247,7 +2291,7 @@ jobs:
               if (g_stop == 2) { t->done = 1; LOG("[thread] tid %x selesai normal (%.1f s CPU)\n", t->tid, t->used); }
               else if (g_stop == 1) { t->done = 1; LOG("[thread] tid %x berhenti: %s\n", t->tid, g_stop_reason); }
               else if (e != UC_ERR_OK) { t->done = 1; char why[120]; snprintf(why, sizeof why, "thread %x: %s", t->tid, uc_strerror(e)); dump_state(why); }
-              else uc_context_save(g_uc, (uc_context *)t->ctx);
+              else { uc_context_save(g_uc, (uc_context *)t->ctx); regs_save(t); }
               g_stop = 0;
           }
 
@@ -2272,6 +2316,8 @@ jobs:
               uint32_t loop = imp_for(tgt, cs(sel));
               LOG("timer: target=%08x selector=\"%s\" imp=%08x\n", tgt, cs(sel), loop);
               if (!loop) { LOG("tidak ada IMP untuk selector timer\n"); return; }
+              { const char *e = getenv("LUXOR_THREAD_SYNC"); if (e) g_thr_sync = atoi(e); }
+              LOG("thread guest: mode %s\n", g_thr_sync ? "sync (sampai selesai)" : "bergantian");
               for (int f = 0; frames <= 0 || f < frames; f++) {
                   g_curframe = f;
                   g_trace = (f < 2);                         /* catat setiap panggilan HLE pada 2 frame pertama */
@@ -2471,7 +2517,7 @@ jobs:
           #endif
               }
               g_logf = fopen("loader_log.txt", "w");
-              LOG("luxor_mac_loader M1 (probe) r16-nosound2\napp: %s\n", app);
+              LOG("luxor_mac_loader M1 (probe) r17-thrsync\napp: %s\n", app);
           #ifndef DRYRUN
               signal(SIGABRT, crash_handler);
               signal(SIGSEGV, crash_handler);
@@ -2735,6 +2781,7 @@ jobs:
           fi
           grep -q "UC_PPC_REG_FPR0" unicorn/include/unicorn/ppc.h && EXTRA+=("-DLUXOR_HAVE_FPR")
           grep -q "UC_PPC_REG_FPSCR" unicorn/include/unicorn/ppc.h && EXTRA+=("-DLUXOR_HAVE_FPSCR")
+          grep -qE "UC_PPC_REG_CR\b" unicorn/include/unicorn/ppc.h && EXTRA+=("-DLUXOR_HAVE_CR")
           # tabel semua model CPU PPC32 supaya bisa dipilih saat runtime (--cpu / LUXOR_CPU)
           {
             echo 'static const struct { const char *name; int id; } g_cpu_models[] = {'
