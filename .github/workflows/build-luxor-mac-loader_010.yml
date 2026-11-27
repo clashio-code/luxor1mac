@@ -550,6 +550,14 @@ jobs:
                       0x4e800420u };                  /* 52 bctr */
                   return native_emit(c, 14);
               }
+              if (!strcmp(name, "_fabs")) {
+                  static const uint32_t c[] = { 0xfc200a10u, 0x4e800020u };                       /* fabs f1,f1 ; blr */
+                  return native_emit(c, 2);
+              }
+              if (!strcmp(name, "_abs")) {
+                  static const uint32_t c[] = { 0x7c64fe70u, 0x7c632278u, 0x7c641850u, 0x4e800020u }; /* srawi r4,r3,31; xor r3,r3,r4; subf r3,r4,r3; blr */
+                  return native_emit(c, 4);
+              }
               if (!strcmp(name, "_sqrt")) {
                   static const uint32_t c[] = { 0xfc20082cu, 0x4e800020u };                       /* fsqrt f1,f1 ; blr */
                   return native_emit(c, 2);
@@ -3676,7 +3684,7 @@ jobs:
               { const char *e = getenv("LUXOR_DEBUG"); if (e && atoi(e)) g_blocktrace = 1; }
               { const char *e = getenv("LUXOR_EMU_COUNT"); if (e && atoi(e)) g_use_count = 1; }
               g_logf = fopen("loader_log.txt", "w");
-              LOG("luxor_mac_loader M1 (probe) r44-snddiag2\napp: %s\n", app);
+              LOG("luxor_mac_loader M1 (probe) r45-sndload\napp: %s\n", app);
           #ifndef DRYRUN
               signal(SIGABRT, crash_handler);
               signal(SIGSEGV, crash_handler);
