@@ -628,6 +628,9 @@ static volatile unsigned g_blkpos;
 static const char *volatile g_lasthle;
 static volatile int g_curframe = -1;
 static int g_blocktrace = 1;
+static volatile uint32_t g_lastins[256];
+static volatile unsigned g_inspos;
+static int g_insntrace = 0;
 static int g_stop;
 static const char *g_stop_reason = "";
 static int g_trace = 0;
@@ -1389,6 +1392,12 @@ static const HleDef g_defs[] = {
 
 #ifndef DRYRUN
 
+static void hook_insn(uc_engine *uc, uint64_t address, uint32_t size, void *ud)
+{
+    (void)uc; (void)size; (void)ud;
+    g_lastins[g_inspos++ & 255] = (uint32_t)address;
+}
+
 static void hook_block(uc_engine *uc, uint64_t address, uint32_t size, void *ud)
 {
     (void)uc; (void)size; (void)ud;
@@ -1397,7 +1406,7 @@ static void hook_block(uc_engine *uc, uint64_t address, uint32_t size, void *ud)
 
 static void crash_handler(int sig)
 {
-    char buf[2600];
+    char buf[6200];
     int n = 0;
     n += snprintf(buf + n, sizeof buf - n, "\n!! SINYAL %d (%s) pada proses loader\n", sig,
                   sig == SIGABRT ? "abort" : sig == SIGSEGV ? "segfault" : sig == SIGBUS ? "bus error" : "lain");
@@ -1408,6 +1417,14 @@ static void crash_handler(int sig)
     for (int i = 0; i < 20 && n < (int)sizeof buf - 240; i++) {
         uint32_t a = g_lastblk[(pos - 1 - (unsigned)i) & 63];
         n += snprintf(buf + n, sizeof buf - n, "     %s\n", describe(a));
+    }
+    if (g_insntrace) {
+        n += snprintf(buf + n, sizeof buf - n, "   instruksi guest terakhir (terbaru dulu; alamat: kode  fungsi):\n");
+        unsigned ip = g_inspos;
+        for (int i = 0; i < 24 && n < (int)sizeof buf - 260; i++) {
+            uint32_t a = g_lastins[(ip - 1 - (unsigned)i) & 255];
+            n += snprintf(buf + n, sizeof buf - n, "     %08x: %08x  %s\n", a, rd32(a), describe(a));
+        }
     }
     if (g_logf) { fwrite(buf, 1, (size_t)n, g_logf); fflush(g_logf); }
     if (write(1, buf, (size_t)n) < 0) { /* abaikan */ }
@@ -1595,11 +1612,12 @@ static void enable_fpu_altivec(void)
 
 static void install_hooks(void)
 {
-    uc_hook h1, h2, h3;
+    uc_hook h1, h2, h3, h4;
     uc_hook_add(g_uc, &h1, UC_HOOK_CODE, (void *)hook_code, NULL, TRAP_BASE, TRAP_BASE + TRAP_SIZE - 1);
     uc_hook_add(g_uc, &h2, UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED | UC_HOOK_MEM_FETCH_UNMAPPED,
                 (void *)hook_unmapped, NULL, 1, 0);
     if (g_blocktrace) uc_hook_add(g_uc, &h3, UC_HOOK_BLOCK, (void *)hook_block, NULL, 1, 0);
+    if (g_insntrace) uc_hook_add(g_uc, &h4, UC_HOOK_CODE, (void *)hook_insn, NULL, 1, 0);
 }
 #endif /* !DRYRUN */
 
@@ -1629,6 +1647,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) g_frames = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--no-boot")) g_noboot = 1;
         else if (!strcmp(argv[i], "--fast")) g_blocktrace = 0;
+        else if (!strcmp(argv[i], "--insn")) g_insntrace = 1;
 #endif
     }
     g_logf = fopen("loader_log.txt", "w");
