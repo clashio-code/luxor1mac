@@ -2001,9 +2001,6 @@ jobs:
               }
           presented:
               ioctl(g_fbdev, FBIOPAN_DISPLAY, &g_vi);
-              /* tahan ~60 fps */
-              double now = mono_s(), want = g_last_present + 1.0 / 60.0;
-              if (now < want) usleep((useconds_t)((want - now) * 1e6));
               g_last_present = mono_s();
           }
 
@@ -2036,6 +2033,74 @@ jobs:
               if (f) { char l[128]; while (fgets(l, sizeof l, f)) if (!strncmp(l, "MemAvailable:", 13)) { avail_kb = atol(l + 13); break; } fclose(f); }
               snprintf(o, n, "RAM proses=%ldMB bebas=%ldMB heap-game=%uMB/%uMB", rss_kb / 1024, avail_kb / 1024,
                        (unsigned)((g_heap_ptr - HEAP_BASE) >> 20), (unsigned)(HEAP_SIZE >> 20));
+          }
+          /* ===== kursor overlay: digerakkan & digambar oleh thread input (~60 Hz), lepas dari fps game ===== */
+          static pthread_mutex_t g_fbmtx = PTHREAD_MUTEX_INITIALIZER;
+          static int g_ov_x = -10000, g_ov_y = -10000;
+          static const char *g_cur_shape[] = {
+              "X           ", "XX          ", "X.X         ", "X..X        ", "X...X       ", "X....X      ",
+              "X.....X     ", "X......X    ", "X.......X   ", "X........X  ", "X.....XXXXX ", "X..X..X     ",
+              "X.X X..X    ", "XX  X..X    ", "X    X..X   ", "     X..X   ", "      XX    ", NULL };
+          static void fb_put(int x, int y, uint32_t p)
+          {
+              if (x < 0 || y < 0 || x >= (int)g_vi.xres || y >= (int)g_vi.yres) return;
+              uint8_t *row = g_fbmem + (size_t)(y + g_vi.yoffset) * g_fi.line_length;
+              if (g_vi.bits_per_pixel == 32) {
+                  uint32_t v = (((p >> 16) & 255) << g_vi.red.offset) | (((p >> 8) & 255) << g_vi.green.offset) | ((p & 255) << g_vi.blue.offset) |
+                               (g_vi.transp.length ? (255u << g_vi.transp.offset) : 0);
+                  ((uint32_t *)row)[x + g_vi.xoffset] = v;
+              } else ((uint16_t *)row)[x + g_vi.xoffset] = (uint16_t)(((p >> 8) & 0xf800) | ((p >> 5) & 0x07e0) | ((p >> 3) & 0x001f));
+          }
+          static void ov_restore_locked(void)
+          {
+              if (g_ov_x < -1000 || !g_fb || !g_mapx) return;
+              for (int y = 0; y < 17; y++) for (int x = 0; x < 12; x++) {
+                  int px = g_ov_x + x, py = g_ov_y + y, lx = px - g_dx, ly = py - g_dy;
+                  uint32_t c = 0xff000000u;
+                  if (lx >= 0 && ly >= 0 && lx < g_dw && ly < g_dh) c = g_fb[(size_t)g_mapy[ly] * g_scr_w + g_mapx[lx]];
+                  fb_put(px, py, c);
+              }
+              g_ov_x = -10000;
+          }
+          static void ov_draw_locked(void)
+          {
+              if (!g_fbmem || !g_dw || !g_cur_show) return;
+              int sx = g_dx + (int)(g_cur_x * g_dw / 800.0), sy = g_dy + (int)(g_cur_y * g_dh / 600.0);
+              for (int y = 0; g_cur_shape[y]; y++) for (int x = 0; g_cur_shape[y][x]; x++) {
+                  char c = g_cur_shape[y][x]; if (c == ' ') continue;
+                  fb_put(sx + x, sy + y, c == 'X' ? 0xff000000u : 0xffffffffu);
+              }
+              g_ov_x = sx; g_ov_y = sy;
+          }
+          static void cursor_overlay_update(void)
+          {
+              if (!g_fbmem || !g_dw) return;
+              pthread_mutex_lock(&g_fbmtx);
+              int sx = g_dx + (int)(g_cur_x * g_dw / 800.0), sy = g_dy + (int)(g_cur_y * g_dh / 600.0);
+              if (sx != g_ov_x || sy != g_ov_y) { ov_restore_locked(); ov_draw_locked(); }
+              pthread_mutex_unlock(&g_fbmtx);
+          }
+          /* gerak kursor: tekan singkat = 1 langkah kecil, tahan = makin cepat (akselerasi) */
+          static void cursor_move_tick(double dt, double *hold_t, int *pdx, int *pdy)
+          {
+              int dx = g_pad_dx, dy = g_pad_dy;
+              double sx = g_stick_x / 1000.0, sy = g_stick_y / 1000.0;
+              int active = dx || dy || sx != 0 || sy != 0;
+              if (!active) { *hold_t = 0; *pdx = *pdy = 0; return; }
+              if (*hold_t == 0) {                                  /* awal tekan: langsung geser 2 piksel game */
+                  g_cur_x += dx * 2; g_cur_y += dy * 2;
+              }
+              *hold_t += dt;
+              double base = g_btn_slow ? 60.0 : 120.0, top = g_btn_slow ? 200.0 : 700.0;
+              double sp = *hold_t < 0.15 ? 0 : base + (top - base) * fmin(1.0, (*hold_t - 0.15) / 0.8);
+              if (sx != 0 || sy != 0) sp = g_btn_slow ? 200.0 : 600.0;
+              g_cur_x += (dx + sx) * sp * dt;
+              g_cur_y += (dy + sy) * sp * dt;
+              if (g_cur_x < 0) g_cur_x = 0;
+              if (g_cur_x > 799) g_cur_x = 799;
+              if (g_cur_y < 0) g_cur_y = 0;
+              if (g_cur_y > 599) g_cur_y = 599;
+              *pdx = dx; *pdy = dy;
           }
           static unsigned long g_hle_fetch_calls;
           static volatile unsigned long g_fpemu_total;
@@ -2141,7 +2206,13 @@ jobs:
                   if (sel && start) quit_now("SELECT+START");
                   if (menu && mono_s() - menu_t > 1.0) quit_now("MENU ditahan 1 detik");
                   if (limit > 0 && mono_s() - t0 > limit) quit_now("batas waktu LUXOR_TIMEOUT");
-                  usleep(20000);
+                  {   /* gerak + gambar kursor ~60 Hz, tidak menunggu frame game */
+                      static double lt, hold; static int pdx, pdy;
+                      double nw = mono_s(), dtc = lt ? nw - lt : 0.016; if (dtc > 0.05) dtc = 0.05; lt = nw;
+                      cursor_move_tick(dtc, &hold, &pdx, &pdy);
+                      cursor_overlay_update();
+                  }
+                  usleep(16000);
               }
               return NULL;
           }
@@ -2242,8 +2313,7 @@ jobs:
               UNUSED;
               g_flushn++;
               unsigned n = g_flushn;
-              cursor_draw();
-              { double pt0 = mono_s(); fbdev_present(); g_t_present += mono_s() - pt0; }
+              { double pt0 = mono_s(); pthread_mutex_lock(&g_fbmtx); g_ov_x = -10000; fbdev_present(); ov_draw_locked(); pthread_mutex_unlock(&g_fbmtx); g_t_present += mono_s() - pt0; }
               if (g_shot_dir[0] && (n <= 3 || n == 20 || n == 300 || n % 1800 == 0)) {
                   char p[800]; snprintf(p, sizeof p, "%s/frame_%04u.bmp", g_shot_dir, n); save_bmp(p);
               }
@@ -2613,15 +2683,10 @@ jobs:
               double now = mono_s();
               double dt = g_last_move_t ? now - g_last_move_t : 1.0 / 30; if (dt > 0.2) dt = 0.2;
               g_last_move_t = now;
-              double sp = g_btn_slow ? 180.0 : 520.0;                                   /* piksel game per detik */
-              double vx = g_pad_dx * sp + g_stick_x * sp / 1000.0, vy = g_pad_dy * sp + g_stick_y * sp / 1000.0;
-              double ox = g_cur_x, oy = g_cur_y;
-              g_cur_x += vx * dt; g_cur_y += vy * dt;
-              if (g_cur_x < 0) g_cur_x = 0;
-              if (g_cur_x > 799) g_cur_x = 799;
-              if (g_cur_y < 0) g_cur_y = 0;
-              if (g_cur_y > 599) g_cur_y = 599;
-              int moved = (ox != g_cur_x || oy != g_cur_y);
+              (void)dt;
+              static double last_x = -1, last_y = -1;
+              int moved = (last_x != g_cur_x || last_y != g_cur_y);
+              last_x = g_cur_x; last_y = g_cur_y;
               int l = g_btn_l, r = g_btn_r;
               int types[4], nt = 0;
               if (l && !g_prev_l) types[nt++] = 1;          /* NSLeftMouseDown */
@@ -3189,7 +3254,7 @@ jobs:
           static void install_stfs_fix(void)
           {
               const char *e = getenv("LUXOR_STFS_FIX");
-              if (e && atoi(e) == 0) { LOG("[stfs] perbaikan pembulatan dimatikan\n"); return; }
+              if (!e || atoi(e) == 0) { LOG("[stfs] perbaikan pembulatan nonaktif (aktifkan: LUXOR_STFS_FIX=1, lambat)\n"); return; }
               unsigned total = 0;
               for (int i = 0; i < g_nimg; i++) {
                   Image *im = g_img[i];
@@ -3303,7 +3368,7 @@ jobs:
               }
               { const char *e = getenv("LUXOR_DEBUG"); if (e && atoi(e)) g_blocktrace = 1; }
               g_logf = fopen("loader_log.txt", "w");
-              LOG("luxor_mac_loader M1 (probe) r33-stfs\napp: %s\n", app);
+              LOG("luxor_mac_loader M1 (probe) r35-cursor60b\napp: %s\n", app);
           #ifndef DRYRUN
               signal(SIGABRT, crash_handler);
               signal(SIGSEGV, crash_handler);
