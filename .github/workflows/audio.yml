@@ -2347,12 +2347,12 @@ jobs:
           /* pthread_create: belum ada thread guest sungguhan.  Thread dicatat, lalu dijalankan sampai selesai
            * di antara frame (lihat stage2).  Cukup untuk thread "loading" Luxor (gameMenuState::_update_init). */
           typedef struct { uint32_t fn, arg, tid; int done, started; uint32_t sp; void *ctx; double used;
-                           uint32_t gpr[32], pc, lr, ctr, xer, cr, msr; uint64_t fpr[32]; } GThread;
+                           uint32_t gpr[32], pc, lr, ctr, xer, cr, msr; uint64_t fpr[32]; int coop; double slice_ms; } GThread;
           static GThread g_thr[32];
           static int g_nthr;
           H(h_pthread_create) {
               uint32_t tid = 0x7000 + (uint32_t)g_nthr;
-              if (g_nthr < 32) { g_thr[g_nthr].fn = a[2]; g_thr[g_nthr].arg = a[3]; g_thr[g_nthr].tid = tid; g_thr[g_nthr].done = 0; g_nthr++; }
+              if (g_nthr < 32) { memset(&g_thr[g_nthr], 0, sizeof g_thr[0]); g_thr[g_nthr].fn = a[2]; g_thr[g_nthr].arg = a[3]; g_thr[g_nthr].tid = tid; g_nthr++; }
               uint8_t *p = g2h(a[0], 4); if (p) wbe32(p, tid);
               LOG("[thread] pthread_create fn=%s arg=%08x -> tid %x (dijalankan setelah frame ini)\n", describe(a[2]), a[3], tid);
               return 0;
@@ -2429,7 +2429,13 @@ jobs:
           H(h_MPCreateTask) {
               static uint32_t tid = 0x5000;
               uint8_t *p = g2h(a[7], 4); if (p) wbe32(p, ++tid);
-              SNDLOG("[snd] MPCreateTask(entry=%s, param=%08x, stack=%u) -> task %x (BELUM dijalankan)\n", describe(a[0]), a[1], a[2], tid);
+              int run = g_aud_want && g_nthr < 32;
+              if (run) {                        /* thread FMOD (stream/async) dijalankan bergantian sedikit tiap frame */
+                  GThread *t = &g_thr[g_nthr++]; memset(t, 0, sizeof *t);
+                  t->fn = a[0]; t->arg = a[1]; t->tid = tid; t->coop = 1;
+                  const char *e = getenv("LUXOR_AU_THREAD_MS"); t->slice_ms = e ? atof(e) : 3.0;
+              }
+              SNDLOG("[snd] MPCreateTask(entry=%s, param=%08x, stack=%u) -> task %x (%s)\n", describe(a[0]), a[1], a[2], tid, run ? "dijalankan bergantian" : "TIDAK dijalankan");
               return 0;
           }
           H(h_MPCreateSemaphore) { static uint32_t sid = 0x5800; uint8_t *p = g2h(a[2], 4); if (p) wbe32(p, ++sid); return 0; }
@@ -2883,7 +2889,7 @@ jobs:
                   regs_load(t);
                   pc = t->pc;
               }
-              if (g_thr_sync) {
+              if (g_thr_sync && !t->coop) {
                   LOG("[thread] tid %x dijalankan sampai selesai (mode sync)\n", t->tid);
                   g_in_thr = (int)t->tid; g_slices++;
                   int r = run_guest(pc, 180.0);
@@ -3026,7 +3032,7 @@ jobs:
           {
               const char *fmt = getenv("LUXOR_AUDIO_CMD");
               char cmd[400];
-              if (!fmt || !*fmt) fmt = "aplay -q -t raw -f S16_LE -c %d -r %d -B 120000 -";
+              if (!fmt || !*fmt) fmt = "aplay -q -t raw -f S16_LE -c %d -r %d -B 50000 -";
               snprintf(cmd, sizeof cmd, fmt, g_aud_ch, g_aud_rate);
               signal(SIGPIPE, SIG_IGN);
               g_aud_pipe = popen(cmd, "w");
@@ -3053,7 +3059,9 @@ jobs:
           static void audio_pump(void)
           {
               if (!g_aud_ok || !g_aud_cb || !g_aud_hdr) return;
-              unsigned bpf = (unsigned)(g_aud_ch * 2), target = (unsigned)(g_aud_rate * 0.12) * bpf;
+              static double tgt_s = -1;
+              if (tgt_s < 0) { const char *e = getenv("LUXOR_AU_MS"); tgt_s = (e ? atof(e) : 60.0) / 1000.0; LOG("[audio] target antrean %.0f ms\n", tgt_s * 1000); }
+              unsigned bpf = (unsigned)(g_aud_ch * 2), target = (unsigned)(g_aud_rate * tgt_s) * bpf;
               if (aud_queued() == 0 && g_aud_blocks) g_aud_under++;
               double t0 = mono_s();
               for (int guard = 0; guard < 8 && aud_queued() < target; guard++) {
@@ -3145,7 +3153,7 @@ jobs:
                   r = call_guest_args(loop, tgt, sel, 0, g_frame_timeout);
                   { double dt = mono_s() - ft0; if (dt > 0.5) LOG("frame %d lama: %.2fs\n", f, dt); }
                   if (r != 2) { LOG("frame %d berhenti, kode=%d (%s)\n", f, r, g_stop_reason); break; }
-                  for (int ti = 0; ti < g_nthr; ti++) thread_slice(&g_thr[ti], g_thr_ms);
+                  for (int ti = 0; ti < g_nthr; ti++) thread_slice(&g_thr[ti], g_thr[ti].coop ? g_thr[ti].slice_ms : g_thr_ms);
                   if (f < 3 || f % 30 == 0) LOG("frame %d selesai\n", f);
               }
               LOG("===== BOOTSTRAP M2 SELESAI =====\n");
@@ -3795,7 +3803,7 @@ jobs:
               { const char *e = getenv("LUXOR_DEBUG"); if (e && atoi(e)) g_blocktrace = 1; }
               { const char *e = getenv("LUXOR_EMU_COUNT"); if (e && atoi(e)) g_use_count = 1; }
               g_logf = fopen("loader_log.txt", "w");
-              LOG("luxor_mac_loader M1 (probe) r46-audio\napp: %s\n", app);
+              LOG("luxor_mac_loader M1 (probe) r47-bgm\napp: %s\n", app);
           #ifndef DRYRUN
               signal(SIGABRT, crash_handler);
               signal(SIGSEGV, crash_handler);
