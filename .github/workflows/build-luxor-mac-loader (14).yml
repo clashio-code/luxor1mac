@@ -1801,6 +1801,8 @@ jobs:
               fbdev_clear_exit();
               _exit(0);
           }
+          static volatile int g_in_thr = -1;          /* tid thread guest yang sedang jalan, -1 = loop utama */
+          static volatile unsigned g_slices;
           static char g_inname[16][64];
           static const char *nm_of(int *fds, int i) { (void)fds; return g_inname[i]; }
           static void *input_thread(void *ud)
@@ -1829,7 +1831,7 @@ jobs:
               if (getenv("LUXOR_KEY_SELECT")) k_sel1 = (unsigned)atoi(getenv("LUXOR_KEY_SELECT"));
               if (getenv("LUXOR_KEY_START"))  k_st1  = (unsigned)atoi(getenv("LUXOR_KEY_START"));
               LOG("[input] keluar = kode %u/%u + %u/%u bersamaan\n", k_sel1, k_sel2, k_st1, k_st2);
-              double t0 = mono_s(), menu_t = 0;
+              double t0 = mono_s(), menu_t = 0, hb_t = mono_s();
               const char *to = getenv("LUXOR_TIMEOUT");
               double limit = to ? atof(to) : 0;
               for (;;) {
@@ -1844,6 +1846,13 @@ jobs:
                           if (ev.code == BTN_MODE || ev.code == KEY_HOMEPAGE || ev.code == KEY_MENU) { menu = dn; if (dn) menu_t = mono_s(); }
                           if (ev.code == KEY_ESC && dn) quit_now("tombol ESC");
                       }
+                  }
+                  if (mono_s() - hb_t > 5.0) {
+                      hb_t = mono_s();
+                      unsigned bp = g_blkpos;
+                      LOG("[hb] t=%.0fs frame=%d jalan=%s slice=%u HLE=%s blok=%s\n", hb_t - t0, g_curframe,
+                          g_in_thr < 0 ? "utama" : "thread", g_slices, g_lasthle ? g_lasthle : "-",
+                          describe(g_lastblk[(bp - 1) & 63]));
                   }
                   if (sel && start) quit_now("SELECT+START");
                   if (menu && mono_s() - menu_t > 1.0) quit_now("MENU ditahan 1 detik");
@@ -2229,8 +2238,11 @@ jobs:
               g_stop = 0;
               enable_fpu_altivec();
               double t0 = mono_s();
+              g_in_thr = (int)t->tid; g_slices++;
               uc_err e = uc_emu_start(g_uc, pc, 0xFFFFFFFFull, (uint64_t)(ms * 1000.0), 0);
+              g_in_thr = -1;
               g_trace = tr0;
+              { double dt = mono_s() - t0; if (dt > 0.5) LOG("[thread] slice tid %x lama %.2fs (diminta %.0f ms) PC=%s\n", t->tid, dt, ms, describe(RPC())); }
               t->used += mono_s() - t0;
               if (g_stop == 2) { t->done = 1; LOG("[thread] tid %x selesai normal (%.1f s CPU)\n", t->tid, t->used); }
               else if (g_stop == 1) { t->done = 1; LOG("[thread] tid %x berhenti: %s\n", t->tid, g_stop_reason); }
@@ -2264,7 +2276,9 @@ jobs:
                   g_curframe = f;
                   g_trace = (f < 2);                         /* catat setiap panggilan HLE pada 2 frame pertama */
                   if (f < 3) LOG("frame %d mulai\n", f);
+                  double ft0 = mono_s();
                   r = call_guest_args(loop, tgt, sel, 0, 20.0);
+                  { double dt = mono_s() - ft0; if (dt > 0.5) LOG("frame %d lama: %.2fs\n", f, dt); }
                   if (r != 2) { LOG("frame %d berhenti, kode=%d (%s)\n", f, r, g_stop_reason); break; }
                   for (int ti = 0; ti < g_nthr; ti++) thread_slice(&g_thr[ti], g_thr_ms);
                   if (f < 3 || f % 30 == 0) LOG("frame %d selesai\n", f);
@@ -2402,6 +2416,27 @@ jobs:
           }
 
           /* ----------------------------------------------------------------- main */
+          /* ===== mode tanpa suara: fungsi pemuat FMOD di snd3d ditambal jadi "return 0" (gagal muat, tanpa decode) =====
+           * Aktif bila env LUXOR_NOSOUND=1 (default di launcher). */
+          static void patch_nosound(void)
+          {
+              const char *e = getenv("LUXOR_NOSOUND");
+              if (!e || atoi(e) == 0) { LOG("[nosound] nonaktif (suara dimuat normal)\n"); return; }
+              static const char *fn[] = {
+                  "_FSOUND_Sample_Load", "_FSOUND_Sample_LoadEx", "_FSOUND_Sample_LoadFromFile",
+                  "_FSOUND_Stream_Open", "_FSOUND_Stream_OpenFile", "_FSOUND_Stream_OpenEx",
+                  "_FMUSIC_LoadSong", "_FMUSIC_LoadSongEx", "_FSOUND_OggVorbis_Load", NULL };
+              for (int i = 0; fn[i]; i++) {
+                  uint32_t ad = 0;
+                  if (!exp_find(fn[i], &ad) && !exp_find(fn[i] + 1, &ad)) { LOG("[nosound] %s tidak ada\n", fn[i]); continue; }
+                  uint8_t *p = g2h(ad, 8);
+                  if (!p) continue;
+                  wbe32(p, 0x38600000u);        /* li r3,0 */
+                  wbe32(p + 4, 0x4e800020u);    /* blr     */
+                  LOG("[nosound] %s @%08x -> return 0\n", fn[i], ad);
+              }
+          }
+
           static void print_image_report(Image *im)
           {
               LOG("  [%2d] %-14s slide=%08x  guest=[%08x..%08x)  dep=%d  extrel=%d(addend!=0:%d) rebase=%d lazy=%d nonlazy=%d nl_local+slide=%d odd=%d\n",
@@ -2425,7 +2460,7 @@ jobs:
           #endif
               }
               g_logf = fopen("loader_log.txt", "w");
-              LOG("luxor_mac_loader M1 (probe) r13-icomp\napp: %s\n", app);
+              LOG("luxor_mac_loader M1 (probe) r15-nosound\napp: %s\n", app);
           #ifndef DRYRUN
               signal(SIGABRT, crash_handler);
               signal(SIGSEGV, crash_handler);
@@ -2485,6 +2520,7 @@ jobs:
                       LOG("  __dyld %s: diisi\n", im->short_name);
                   }
               }
+              patch_nosound();
               for (int i = 0; i < g_nimg; i++) print_image_report(g_img[i]);
               print_hle_summary();
 
@@ -2563,14 +2599,14 @@ jobs:
           LOADER_C_EOF
           cat > src/Luxor_Mac.sh <<'LUXOR_SH_EOF'
           #!/bin/sh
-          # Luxor Mac (PowerPC) -> Linux ARM64 | Milestone 1 | peluncur diagnostik v12 (muOS)
+          # Luxor Mac (PowerPC) -> Linux ARM64 | Milestone 1 | peluncur diagnostik v13 (muOS)
           # Skrip ini di ROMS/Ports ; folder "luxor_mac" (berisi luxor_mac_loader dan Luxor_Mac/Luxor.app)
           # dicari otomatis di beberapa lokasi umum.
           DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
           L1="$DIR/luxor_mac_launcher.txt"
 
           {
-            echo "== peluncur v12 mulai: $(date 2>&1)"
+            echo "== peluncur v13 mulai: $(date 2>&1)"
             echo "script : $0"
             echo "DIR    : $DIR"
           } > "$L1" 2>&1
@@ -2626,6 +2662,8 @@ jobs:
           rm -rf "$GAME/frames"
           # batas waktu darurat (detik); 0 = tanpa batas. Keluar manual: SELECT+START atau tahan MENU 1 detik
           export LUXOR_TIMEOUT="${LUXOR_TIMEOUT:-300}"
+          # 1 = lewati pemuatan suara (tes sampai main menu); 0 = muat suara
+          export LUXOR_NOSOUND="${LUXOR_NOSOUND:-1}"
           { echo "-- memori:"; head -4 /proc/meminfo 2>&1; echo "overcommit: $(cat /proc/sys/vm/overcommit_memory 2>&1)"; echo "ulimit -v: $(ulimit -v 2>&1)"; } >> "$L1" 2>&1
           # buffer JIT: dari besar ke kecil sampai berhasil dialokasikan
           MB=64
