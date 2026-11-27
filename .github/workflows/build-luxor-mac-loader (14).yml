@@ -1049,14 +1049,15 @@ jobs:
           /* ===================== kursor virtual (gamepad -> mouse) ===================== */
           static volatile int g_pad_dx, g_pad_dy;           /* D-pad: -1/0/1 */
           static volatile int g_stick_x, g_stick_y;         /* stick analog, -1000..1000 */
-          static volatile int g_btn_l, g_btn_r, g_btn_slow; /* A = klik kiri, B = klik kanan, L1 = pelan */
+          static volatile int g_btn_l, g_btn_r, g_btn_slow;
+          static volatile int g_key_req;                    /* 1=ketik nama, 2=backspace, 3=enter */ /* A = klik kiri, B = klik kanan, L1 = pelan */
           static double g_cur_x = 400, g_cur_y = 300;       /* posisi kursor (koordinat game, kiri-atas) */
           static int g_cur_show = 1;
           static int g_absmin[64], g_absmax[64], g_absok[64];
           /* ---- NSEvent / jendela / mouse ---- */
           static uint32_t g_sret;                 /* alamat hasil struct (objc_msgSend_stret) */
           static uint32_t g_window_obj;           /* jendela game (MJWindow) */
-          typedef struct { uint32_t obj; int type; float x, y; } GEvent;
+          typedef struct { uint32_t obj; int type; float x, y; int ch, kc; } GEvent;
           static GEvent g_ev[16];
           static int g_nev;
           static uint32_t g_cur_event;
@@ -1075,11 +1076,12 @@ jobs:
               if (e) {
                   if (!strcmp(sel, "type")) { *ret = (uint32_t)e->type; return 1; }
                   if (!strcmp(sel, "locationInWindow")) { ret_point(e->x, e->y); *ret = 0; return 1; }
-                  if (!strcmp(sel, "modifierFlags") || !strcmp(sel, "keyCode")) { *ret = 0; return 1; }
+                  if (!strcmp(sel, "modifierFlags")) { *ret = 0; return 1; }
+                  if (!strcmp(sel, "keyCode")) { *ret = (uint32_t)e->kc; return 1; }
                   if (!strcmp(sel, "clickCount")) { *ret = 1; return 1; }
                   if (!strcmp(sel, "buttonNumber")) { *ret = (e->type == 3 || e->type == 4) ? 1 : 0; return 1; }
                   if (!strcmp(sel, "window")) { *ret = g_window_obj; return 1; }
-                  if (!strcmp(sel, "characters") || !strcmp(sel, "charactersIgnoringModifiers")) { *ret = nsstr(""); return 1; }
+                  if (!strcmp(sel, "characters") || !strcmp(sel, "charactersIgnoringModifiers")) { char cb[2] = { (char)e->ch, 0 }; *ret = nsstr(cb); return 1; }
                   if (!strcmp(sel, "deltaX") || !strcmp(sel, "deltaY")) { SF(1, 0); *ret = 0; return 1; }
               }
               if (!strcmp(sel, "mouseLocationOutsideOfEventStream")) { ret_point(win_x(), win_y()); *ret = 0; return 1; }
@@ -2084,6 +2086,9 @@ jobs:
                               case 304: g_btn_l = dn; break;      /* A (muOS) */
                               case 305: g_btn_r = dn; break;      /* B (muOS) */
                               case 308: g_btn_slow = dn; break;   /* L1 = kursor pelan */
+                              case 307: if (dn) g_key_req = 1; break;   /* Y  = ketik nama + Enter */
+                              case 306: if (dn) g_key_req = 2; break;   /* X  = Backspace */
+                              case 309: if (dn) g_key_req = 3; break;   /* R1 = Enter */
                               default: break;
                               }
                           }
@@ -2605,16 +2610,34 @@ jobs:
               if (!r && g_prev_r) types[nt++] = 4;          /* NSRightMouseUp */
               if (moved && nt == 0) types[nt++] = l ? 6 : 5;   /* LeftMouseDragged / MouseMoved */
               g_prev_l = l; g_prev_r = r;
+              /* antrean tombol keyboard */
+              static int kq_ch[40], kq_kc[40], kq_n, kq_i;
+              int req = g_key_req; g_key_req = 0;
+              if (req && kq_i >= kq_n) {
+                  kq_n = kq_i = 0;
+                  if (req == 1) {
+                      const char *nm = getenv("LUXOR_NAME"); if (!nm || !*nm) nm = "PLAYER";
+                      for (int i = 0; nm[i] && kq_n < 30; i++) { kq_ch[kq_n] = (unsigned char)nm[i]; kq_kc[kq_n] = 0; kq_n++; }
+                      kq_ch[kq_n] = 13; kq_kc[kq_n] = 36; kq_n++;
+                  } else if (req == 2) { kq_ch[0] = 127; kq_kc[0] = 51; kq_n = 1; }
+                  else { kq_ch[0] = 13; kq_kc[0] = 36; kq_n = 1; }
+                  LOG("[input] keyboard: %d tombol dikirim\n", kq_n);
+              }
               if (!g_app_obj) return;
               if (!g_sendev_imp) {
                   g_sendev_imp = imp_for(g_app_obj, "sendEvent:");
                   LOG("[input] -[NSApp sendEvent:] imp=%08x\n", g_sendev_imp);
                   if (!g_sendev_imp) g_sendev_imp = 1;
               }
+              if (kq_i < kq_n && nt < 2) {                     /* satu tombol per frame: KeyDown(10) lalu KeyUp(11) */
+                  types[nt++] = 10; types[nt++] = 11;
+              }
+              int kch = kq_i < kq_n ? kq_ch[kq_i] : 0, kkc = kq_i < kq_n ? kq_kc[kq_i] : 0;
               for (int i = 0; i < nt; i++) {
                   GEvent *e = &g_ev[g_nev++ & 15];
                   if (!e->obj) e->obj = new_obj_sys("NSEvent");
                   e->type = types[i]; e->x = win_x(); e->y = win_y();
+                  e->ch = (types[i] == 10 || types[i] == 11) ? kch : 0; e->kc = (types[i] == 10 || types[i] == 11) ? kkc : 0;
                   g_cur_event = e->obj;
                   static int evl; if (evl < 30 && types[i] != 5 && types[i] != 6) { evl++; LOG("[input] event type=%d @%.0f,%.0f\n", types[i], g_cur_x, g_cur_y); }
                   if (g_sendev_imp > 1) {
@@ -2624,6 +2647,7 @@ jobs:
                       if (rr != 2) LOG("[input] sendEvent: gagal kode=%d (%s)\n", rr, g_stop_reason);
                   }
               }
+              if (kq_i < kq_n && nt >= 2 && types[nt - 1] == 11) kq_i++;
           }
           /* gambar panah kursor sederhana di framebuffer software (setelah game selesai menggambar) */
           static void cursor_draw(void)
@@ -3024,7 +3048,7 @@ jobs:
               }
               { const char *e = getenv("LUXOR_DEBUG"); if (e && atoi(e)) g_blocktrace = 1; }
               g_logf = fopen("loader_log.txt", "w");
-              LOG("luxor_mac_loader M1 (probe) r28-hlesc\napp: %s\n", app);
+              LOG("luxor_mac_loader M1 (probe) r29-keys\napp: %s\n", app);
           #ifndef DRYRUN
               signal(SIGABRT, crash_handler);
               signal(SIGSEGV, crash_handler);
@@ -3174,14 +3198,14 @@ jobs:
           LOADER_C_EOF
           cat > src/Luxor_Mac.sh <<'LUXOR_SH_EOF'
           #!/bin/sh
-          # Luxor Mac (PowerPC) -> Linux ARM64 | Milestone 1 | peluncur diagnostik v14 (muOS)
+          # Luxor Mac (PowerPC) -> Linux ARM64 | Milestone 1 | peluncur diagnostik v15 (muOS)
           # Skrip ini di ROMS/Ports ; folder "luxor_mac" (berisi luxor_mac_loader dan Luxor_Mac/Luxor.app)
           # dicari otomatis di beberapa lokasi umum.
           DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
           L1="$DIR/luxor_mac_launcher.txt"
 
           {
-            echo "== peluncur v14 mulai: $(date 2>&1)"
+            echo "== peluncur v15 mulai: $(date 2>&1)"
             echo "script : $0"
             echo "DIR    : $DIR"
           } > "$L1" 2>&1
@@ -3236,6 +3260,8 @@ jobs:
 
           rm -rf "$GAME/frames"
           # Kontrol: D-pad/stick = kursor, A = klik kiri, B = klik kanan, L1 = kursor pelan
+          # Y = ketik nama (LUXOR_NAME) + Enter, X = Backspace, R1 = Enter
+          export LUXOR_NAME="${LUXOR_NAME:-PLAYER}"
           # batas waktu darurat (detik); 0 = tanpa batas. Keluar manual: SELECT+START atau tahan MENU 1 detik
           export LUXOR_TIMEOUT="${LUXOR_TIMEOUT:-0}"
           # 1 = lewati pemuatan suara (tes sampai main menu); 0 = muat suara
