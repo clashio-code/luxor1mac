@@ -2396,10 +2396,9 @@ jobs:
           static unsigned g_snd_log;
           #define SNDLOG(...) do { if (g_snd_log++ < 120) LOG(__VA_ARGS__); } while (0)
           H(h_SndNewChannel) {
+              /* hanya catat; jangan menulis *chanPtr (FMOD memakai nilai 0 untuk melewati jalur Sound Manager) */
               uint8_t *pp = g2h(a[0], 4);
-              uint32_t ch = pp ? be32(pp) : 0;
-              if (!ch) { ch = heap_alloc(1024); if (pp) wbe32(pp, ch); }
-              SNDLOG("[snd] SndNewChannel(chanPtr=%08x -> %08x, synth=%d, init=%08x, callback=%s)\n", a[0], ch, (int16_t)a[1], a[2], a[3] ? describe(a[3]) : "-");
+              SNDLOG("[snd] SndNewChannel(chanPtr=%08x isi=%08x, synth=%d, init=%08x, callback=%s)\n", a[0], pp ? be32(pp) : 0, (int16_t)a[1], a[2], a[3] ? describe(a[3]) : "-");
               return 0;
           }
           H(h_SndDoCommand) {
@@ -3677,7 +3676,7 @@ jobs:
               { const char *e = getenv("LUXOR_DEBUG"); if (e && atoi(e)) g_blocktrace = 1; }
               { const char *e = getenv("LUXOR_EMU_COUNT"); if (e && atoi(e)) g_use_count = 1; }
               g_logf = fopen("loader_log.txt", "w");
-              LOG("luxor_mac_loader M1 (probe) r43-snddiag\napp: %s\n", app);
+              LOG("luxor_mac_loader M1 (probe) r44-snddiag2\napp: %s\n", app);
           #ifndef DRYRUN
               signal(SIGABRT, crash_handler);
               signal(SIGSEGV, crash_handler);
