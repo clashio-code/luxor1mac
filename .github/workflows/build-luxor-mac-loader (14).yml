@@ -1041,11 +1041,64 @@ jobs:
               return r;
           }
 
+          static double F(int i);
+          static void SF(int i, double d);
+          /* ===================== kursor virtual (gamepad -> mouse) ===================== */
+          static volatile int g_pad_dx, g_pad_dy;           /* D-pad: -1/0/1 */
+          static volatile int g_stick_x, g_stick_y;         /* stick analog, -1000..1000 */
+          static volatile int g_btn_l, g_btn_r, g_btn_slow; /* A = klik kiri, B = klik kanan, L1 = pelan */
+          static double g_cur_x = 400, g_cur_y = 300;       /* posisi kursor (koordinat game, kiri-atas) */
+          static int g_cur_show = 1;
+          static int g_absmin[64], g_absmax[64], g_absok[64];
+          /* ---- NSEvent / jendela / mouse ---- */
+          static uint32_t g_sret;                 /* alamat hasil struct (objc_msgSend_stret) */
+          static uint32_t g_window_obj;           /* jendela game (MJWindow) */
+          typedef struct { uint32_t obj; int type; float x, y; } GEvent;
+          static GEvent g_ev[16];
+          static int g_nev;
+          static uint32_t g_cur_event;
+          static void put_f32(uint32_t ad, float f) { uint8_t *p = g2h(ad, 4); uint32_t u; memcpy(&u, &f, 4); if (p) wbe32(p, u); }
+          static void ret_point(float x, float y) { if (g_sret) { put_f32(g_sret, x); put_f32(g_sret + 4, y); } }
+          static void ret_rect(float x, float y, float w, float h) { if (g_sret) { put_f32(g_sret, x); put_f32(g_sret + 4, y); put_f32(g_sret + 8, w); put_f32(g_sret + 12, h); } }
+          static GEvent *ev_find(uint32_t o) { for (int i = 0; i < 16; i++) if (g_ev[i].obj == o) return &g_ev[i]; return NULL; }
+          /* koordinat jendela Cocoa: asal di kiri-bawah */
+          static float win_x(void) { return (float)g_cur_x; }
+          static float win_y(void) { return (float)(600 - g_cur_y); }
+
+          static int sys_msg_input(const char *cn, uint32_t self, const char *sel, uint32_t *a, uint32_t *ret)
+          {
+              (void)a;
+              GEvent *e = ev_find(self);
+              if (e) {
+                  if (!strcmp(sel, "type")) { *ret = (uint32_t)e->type; return 1; }
+                  if (!strcmp(sel, "locationInWindow")) { ret_point(e->x, e->y); *ret = 0; return 1; }
+                  if (!strcmp(sel, "modifierFlags") || !strcmp(sel, "keyCode")) { *ret = 0; return 1; }
+                  if (!strcmp(sel, "clickCount")) { *ret = 1; return 1; }
+                  if (!strcmp(sel, "buttonNumber")) { *ret = (e->type == 3 || e->type == 4) ? 1 : 0; return 1; }
+                  if (!strcmp(sel, "window")) { *ret = g_window_obj; return 1; }
+                  if (!strcmp(sel, "characters") || !strcmp(sel, "charactersIgnoringModifiers")) { *ret = nsstr(""); return 1; }
+                  if (!strcmp(sel, "deltaX") || !strcmp(sel, "deltaY")) { SF(1, 0); *ret = 0; return 1; }
+              }
+              if (!strcmp(sel, "mouseLocationOutsideOfEventStream")) { ret_point(win_x(), win_y()); *ret = 0; return 1; }
+              if (!strcmp(sel, "keyWindow") || !strcmp(sel, "mainWindow")) { *ret = g_window_obj; return 1; }
+              if (!strcmp(sel, "currentEvent")) { *ret = g_cur_event; return 1; }
+              if (!strcmp(sel, "frame") || !strcmp(sel, "bounds") || !strcmp(sel, "visibleFrame")) { ret_rect(0, 0, 800.0f, 600.0f); *ret = 0; return 1; }
+              if (!strcmp(sel, "mainScreen")) { *ret = singleton("NSScreen"); return 1; }
+              if (!strncmp(sel, "convertBaseToScreen:", 20) || !strncmp(sel, "convertScreenToBase:", 20) ||
+                  !strncmp(sel, "convertPoint:", 13)) { ret_point((float)F(1), (float)F(2)); *ret = 0; return 1; }
+              if (!strcmp(cn, "NSWindow") && !strncmp(sel, "initWithContentRect:", 20)) {
+                  g_window_obj = self;
+                  LOG("[input] jendela game = %08x\n", self);
+                  *ret = self; return 1;
+              }
+              return 0;
+          }
           static uint32_t sys_msg(const char *cn, int is_class, GClass *gc, uint32_t self, const char *sel, uint32_t *a)
           {
               char key[220];
               snprintf(key, sizeof key, "%c[%s %s]", is_class ? '+' : '-', cn, sel);
               if (seen_first(key)) LOG("    objc: %s\n", key);
+              { uint32_t rv = 0; if (sys_msg_input(cn, self, sel, a, &rv)) return rv; }
               if (is_class) {
                   if (!strcmp(sel, "alloc") || !strcmp(sel, "allocWithZone:") || !strcmp(sel, "new"))
                       return gc ? new_obj_guest(gc) : new_obj_sys(cn);
@@ -1380,7 +1433,7 @@ jobs:
           H(h_mkdir)   { const char *p = (const char *)g2h(a[0], 1); if (!p) return 0xffffffffu; int r = mkdir(p, 0755); return (r == 0 || errno == EEXIST) ? 0 : 0xffffffffu; }
 
           H(h_msgsend)       { return do_msg(a[0], a[1], a); }
-          H(h_msgsend_stret) { uint32_t b[8]; for (int k = 0; k < 7; k++) b[k] = a[k + 1]; b[7] = 0; return do_msg(b[0], b[1], b); }
+          H(h_msgsend_stret) { uint32_t b[8]; for (int k = 0; k < 7; k++) b[k] = a[k + 1]; b[7] = 0; g_sret = a[0]; uint32_t r = do_msg(b[0], b[1], b); g_sret = 0; return r; }
           H(h_msgsend_super) {
               uint32_t recv = rd32(a[0]), kl = rd32(a[0] + 4);
               uint32_t b[8];
@@ -1820,6 +1873,13 @@ jobs:
                       char nm[128] = "?"; ioctl(fd, EVIOCGNAME(sizeof nm), nm);
                       LOG("[input] %s = \"%s\"\n", p, nm);
                       snprintf(g_inname[nfd], sizeof g_inname[0], "%s", e->d_name);
+                      for (int ax = 0; ax < 64; ax++) {
+                          struct input_absinfo ai;
+                          if (ioctl(fd, EVIOCGABS(ax), &ai) == 0 && ai.maximum > ai.minimum && !g_absok[ax]) {
+                              g_absmin[ax] = ai.minimum; g_absmax[ax] = ai.maximum; g_absok[ax] = 1;
+                              LOG("[input]   abs %d: %d..%d\n", ax, ai.minimum, ai.maximum);
+                          }
+                      }
                       fds[nfd++] = fd;
                   }
                   closedir(dir);
@@ -1838,7 +1898,33 @@ jobs:
                   for (int i = 0; i < nfd; i++) {
                       struct input_event ev;
                       while (read(fds[i], &ev, sizeof ev) == (ssize_t)sizeof ev) {
+                          if (ev.type == EV_ABS) {
+                              int ax = ev.code, v = ev.value;
+                              if (ax == ABS_HAT0X) g_pad_dx = v < 0 ? -1 : v > 0 ? 1 : 0;
+                              else if (ax == ABS_HAT0Y) g_pad_dy = v < 0 ? -1 : v > 0 ? 1 : 0;
+                              else if (ax < 64 && g_absok[ax] && (ax == ABS_X || ax == ABS_Y || ax == ABS_RX || ax == ABS_RY)) {
+                                  int mid = (g_absmin[ax] + g_absmax[ax]) / 2, half = (g_absmax[ax] - g_absmin[ax]) / 2;
+                                  int n = half ? (int)((long)(v - mid) * 1000 / half) : 0;
+                                  if (n > -150 && n < 150) n = 0;                       /* deadzone */
+                                  if (ax == ABS_X || ax == ABS_RX) g_stick_x = n; else g_stick_y = n;
+                              }
+                              static int absl; if (absl < 20 && (ax == ABS_HAT0X || ax == ABS_HAT0Y)) { absl++; LOG("[input] abs kode=%d nilai=%d\n", ax, v); }
+                              continue;
+                          }
                           if (ev.type != EV_KEY) continue;
+                          {
+                              int dn = ev.value != 0;
+                              switch (ev.code) {
+                              case BTN_DPAD_UP: case KEY_UP:       g_pad_dy = dn ? -1 : (g_pad_dy == -1 ? 0 : g_pad_dy); break;
+                              case BTN_DPAD_DOWN: case KEY_DOWN:   g_pad_dy = dn ?  1 : (g_pad_dy ==  1 ? 0 : g_pad_dy); break;
+                              case BTN_DPAD_LEFT: case KEY_LEFT:   g_pad_dx = dn ? -1 : (g_pad_dx == -1 ? 0 : g_pad_dx); break;
+                              case BTN_DPAD_RIGHT: case KEY_RIGHT: g_pad_dx = dn ?  1 : (g_pad_dx ==  1 ? 0 : g_pad_dx); break;
+                              case 304: g_btn_l = dn; break;      /* A (muOS) */
+                              case 305: g_btn_r = dn; break;      /* B (muOS) */
+                              case 308: g_btn_slow = dn; break;   /* L1 = kursor pelan */
+                              default: break;
+                              }
+                          }
                           if (ev.value != 2 && logged < 200) { logged++; LOG("[input] %s kode=%u nilai=%d\n", nm_of(fds, i), ev.code, ev.value); }
                           int dn = ev.value != 0;
                           if (ev.code == k_sel1 || ev.code == k_sel2 || ev.code == KEY_BACKSPACE || ev.code == KEY_RIGHTSHIFT) sel = dn;
@@ -1926,6 +2012,7 @@ jobs:
               return 0;
           }
 
+          static void cursor_draw(void);
           H(h_glGetError)   { UNUSED; return 0; }
           H(h_glEnable)     {
               if (a[0] == 0x0BE2) g_en_blend = 1; else if (a[0] == 0x0DE1) g_en_tex2d = 1; else if (a[0] == 0x84F5) g_en_texrect = 1;
@@ -1957,6 +2044,7 @@ jobs:
               UNUSED;
               g_flushn++;
               unsigned n = g_flushn;
+              cursor_draw();
               fbdev_present();
               if (g_shot_dir[0] && (n <= 3 || n == 20 || n == 300 || n % 1800 == 0)) {
                   char p[800]; snprintf(p, sizeof p, "%s/frame_%04u.bmp", g_shot_dir, n); save_bmp(p);
@@ -2044,7 +2132,7 @@ jobs:
               {"__keymgr_unlock_processwide_ptr", h_zero},
               {"__keymgr_get_per_thread_data", h_kmt_get}, {"__keymgr_set_per_thread_data", h_kmt_set},
               {"_printf", h_printf}, {"_fprintf", h_fprintf}, {"_sprintf", h_sprintf}, {"_snprintf", h_snprintf},
-              {"_vsnprintf", h_vsnprintf}, {"_puts", h_puts}, {"_write", h_write}, {"_fopen", h_fopen}, {"_pthread_create", h_pthread_create}, {"_pthread_join", h_pthread_join}, {"_pthread_detach", h_zero}, {"_qsort", h_qsort}, {"_pthread_self", h_pthread_self},
+              {"_vsnprintf", h_vsnprintf}, {"_puts", h_puts}, {"_write", h_write}, {"_fopen", h_fopen}, {"_pthread_create", h_pthread_create}, {"_pthread_join", h_pthread_join}, {"_pthread_detach", h_zero}, {"_CGDisplayHideCursor", h_zero}, {"_CGDisplayShowCursor", h_zero}, {"_CGAssociateMouseAndMouseCursorPosition", h_zero}, {"_CGDisplayMoveCursorToPoint", h_zero}, {"_qsort", h_qsort}, {"_pthread_self", h_pthread_self},
               {"_glGetError", h_glGetError}, {"_glEnable", h_glEnable}, {"_glDisable", h_glDisable}, {"_glBlendFunc", h_glBlendFunc},
               {"_glColor4ub", h_glColor4ub}, {"_glColor4ubv", h_glColor4ubv}, {"_glColor4f", h_glColor4f}, {"_glColor3f", h_glColor3f},
               {"_glBegin", h_glBegin}, {"_glEnd", h_glEnd}, {"_glTexCoord2f", h_glTexCoord2f}, {"_glVertex2i", h_glVertex2i},
@@ -2295,6 +2383,73 @@ jobs:
               g_stop = 0;
           }
 
+          /* gerakkan kursor dan kirim event mouse ke game lewat -[LuxorApplication sendEvent:] */
+          static uint32_t g_sendev_imp;
+          static int g_prev_l, g_prev_r;
+          static double g_last_move_t;
+          static void cursor_step(void)
+          {
+              double now = mono_s();
+              double dt = g_last_move_t ? now - g_last_move_t : 1.0 / 30; if (dt > 0.2) dt = 0.2;
+              g_last_move_t = now;
+              double sp = g_btn_slow ? 180.0 : 520.0;                                   /* piksel game per detik */
+              double vx = g_pad_dx * sp + g_stick_x * sp / 1000.0, vy = g_pad_dy * sp + g_stick_y * sp / 1000.0;
+              double ox = g_cur_x, oy = g_cur_y;
+              g_cur_x += vx * dt; g_cur_y += vy * dt;
+              if (g_cur_x < 0) g_cur_x = 0;
+              if (g_cur_x > 799) g_cur_x = 799;
+              if (g_cur_y < 0) g_cur_y = 0;
+              if (g_cur_y > 599) g_cur_y = 599;
+              int moved = (ox != g_cur_x || oy != g_cur_y);
+              int l = g_btn_l, r = g_btn_r;
+              int types[4], nt = 0;
+              if (l && !g_prev_l) types[nt++] = 1;          /* NSLeftMouseDown */
+              if (!l && g_prev_l) types[nt++] = 2;          /* NSLeftMouseUp */
+              if (r && !g_prev_r) types[nt++] = 3;          /* NSRightMouseDown */
+              if (!r && g_prev_r) types[nt++] = 4;          /* NSRightMouseUp */
+              if (moved && nt == 0) types[nt++] = l ? 6 : 5;   /* LeftMouseDragged / MouseMoved */
+              g_prev_l = l; g_prev_r = r;
+              if (!g_app_obj) return;
+              if (!g_sendev_imp) {
+                  g_sendev_imp = imp_for(g_app_obj, "sendEvent:");
+                  LOG("[input] -[NSApp sendEvent:] imp=%08x\n", g_sendev_imp);
+                  if (!g_sendev_imp) g_sendev_imp = 1;
+              }
+              for (int i = 0; i < nt; i++) {
+                  GEvent *e = &g_ev[g_nev++ & 15];
+                  if (!e->obj) e->obj = new_obj_sys("NSEvent");
+                  e->type = types[i]; e->x = win_x(); e->y = win_y();
+                  g_cur_event = e->obj;
+                  static int evl; if (evl < 30 && types[i] != 5 && types[i] != 6) { evl++; LOG("[input] event type=%d @%.0f,%.0f\n", types[i], g_cur_x, g_cur_y); }
+                  if (g_sendev_imp > 1) {
+                      int tr0 = g_trace; g_trace = 0;
+                      int rr = call_guest_args(g_sendev_imp, g_app_obj, intern("sendEvent:"), e->obj, 5.0);
+                      g_trace = tr0;
+                      if (rr != 2) LOG("[input] sendEvent: gagal kode=%d (%s)\n", rr, g_stop_reason);
+                  }
+              }
+          }
+          /* gambar panah kursor sederhana di framebuffer software (setelah game selesai menggambar) */
+          static void cursor_draw(void)
+          {
+              if (!g_fb || !g_cur_show) return;
+              static const char *shape[] = {
+                  "X           ", "XX          ", "X.X         ", "X..X        ", "X...X       ", "X....X      ",
+                  "X.....X     ", "X......X    ", "X.......X   ", "X........X  ", "X.....XXXXX ", "X..X..X     ",
+                  "X.X X..X    ", "XX  X..X    ", "X    X..X   ", "     X..X   ", "      XX    ", NULL };
+              double s = (double)g_scr_w / 800.0;
+              int cx = (int)(g_cur_x * s), cy = (int)(g_cur_y * s);
+              int sc = g_scr_w >= 800 ? 2 : 1;
+              for (int y = 0; shape[y]; y++)
+                  for (int x = 0; shape[y][x]; x++) {
+                      char c = shape[y][x]; if (c == ' ') continue;
+                      uint32_t col = c == 'X' ? 0xff000000u : 0xffffffffu;
+                      for (int yy = 0; yy < sc; yy++) for (int xx = 0; xx < sc; xx++) {
+                          int px = cx + x * sc + xx, py = cy + y * sc + yy;
+                          if (px >= 0 && py >= 0 && px < g_scr_w && py < g_scr_h) g_fb[(size_t)py * g_scr_w + px] = col;
+                      }
+                  }
+          }
           static void stage2(int frames)
           {
               LOG("\n===== BOOTSTRAP M2 =====\n");
@@ -2322,6 +2477,7 @@ jobs:
                   g_curframe = f;
                   g_trace = (f < 2);                         /* catat setiap panggilan HLE pada 2 frame pertama */
                   if (f < 3) LOG("frame %d mulai\n", f);
+                  cursor_step();
                   double ft0 = mono_s();
                   r = call_guest_args(loop, tgt, sel, 0, 20.0);
                   { double dt = mono_s() - ft0; if (dt > 0.5) LOG("frame %d lama: %.2fs\n", f, dt); }
@@ -2517,7 +2673,7 @@ jobs:
           #endif
               }
               g_logf = fopen("loader_log.txt", "w");
-              LOG("luxor_mac_loader M1 (probe) r17-thrsync\napp: %s\n", app);
+              LOG("luxor_mac_loader M1 (probe) r18-cursor\napp: %s\n", app);
           #ifndef DRYRUN
               signal(SIGABRT, crash_handler);
               signal(SIGSEGV, crash_handler);
@@ -2656,14 +2812,14 @@ jobs:
           LOADER_C_EOF
           cat > src/Luxor_Mac.sh <<'LUXOR_SH_EOF'
           #!/bin/sh
-          # Luxor Mac (PowerPC) -> Linux ARM64 | Milestone 1 | peluncur diagnostik v13 (muOS)
+          # Luxor Mac (PowerPC) -> Linux ARM64 | Milestone 1 | peluncur diagnostik v14 (muOS)
           # Skrip ini di ROMS/Ports ; folder "luxor_mac" (berisi luxor_mac_loader dan Luxor_Mac/Luxor.app)
           # dicari otomatis di beberapa lokasi umum.
           DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
           L1="$DIR/luxor_mac_launcher.txt"
 
           {
-            echo "== peluncur v13 mulai: $(date 2>&1)"
+            echo "== peluncur v14 mulai: $(date 2>&1)"
             echo "script : $0"
             echo "DIR    : $DIR"
           } > "$L1" 2>&1
@@ -2717,8 +2873,9 @@ jobs:
           [ -d "$APP/Contents/MacOS" ] || echo "PERINGATAN: $APP/Contents/MacOS tidak ada" >> "$L1"
 
           rm -rf "$GAME/frames"
+          # Kontrol: D-pad/stick = kursor, A = klik kiri, B = klik kanan, L1 = kursor pelan
           # batas waktu darurat (detik); 0 = tanpa batas. Keluar manual: SELECT+START atau tahan MENU 1 detik
-          export LUXOR_TIMEOUT="${LUXOR_TIMEOUT:-300}"
+          export LUXOR_TIMEOUT="${LUXOR_TIMEOUT:-0}"
           # 1 = lewati pemuatan suara (tes sampai main menu); 0 = muat suara
           export LUXOR_NOSOUND="${LUXOR_NOSOUND:-1}"
           { echo "-- memori:"; head -4 /proc/meminfo 2>&1; echo "overcommit: $(cat /proc/sys/vm/overcommit_memory 2>&1)"; echo "ulimit -v: $(ulimit -v 2>&1)"; } >> "$L1" 2>&1
