@@ -2486,6 +2486,8 @@ jobs:
           H(h_MPCreateSemaphore) { static uint32_t sid = 0x5800; uint8_t *p = g2h(a[2], 4); if (p) wbe32(p, ++sid); return 0; }
           H(h_MPCurrentTaskID) { UNUSED; return 0x5000; }
           H(h_MPIsInit) { UNUSED; return 1; }
+          static void gl_col_to_guest(void);
+          static void gl_col_from_guest(void);
           H(h_glGetError)   { UNUSED; return 0; }
           H(h_glEnable)     {
               if (a[0] == 0x0BE2) g_en_blend = 1; else if (a[0] == 0x0DE1) g_en_tex2d = 1; else if (a[0] == 0x84F5) g_en_texrect = 1;
@@ -3857,7 +3859,7 @@ jobs:
                       else if (x == 26) ok = fabs(gd - wd) <= fabs(wd) / 30.0;
                       else if ((keys[k] >> 16) == 59) ok = (got == want) || fabs(gd - wd) <= fabs(wd) * 2e-7;
                       else ok = (got == want) || fabs(gd - wd) <= fabs(wd) * 1e-15;
-                      if (!ok) { bad = 1; snprintf(why, sizeof why, "a=%g b=%g c=%g -> emulator %.9g (%016llx), seharusnya %.9g", a, b, c, gd, (unsigned long long)got, wd, (unsigned long long)want); }
+                      if (!ok) { bad = 1; snprintf(why, sizeof why, "a=%g b=%g c=%g -> emulator %.9g (%016llx), seharusnya %.9g (%016llx)", a, b, c, gd, (unsigned long long)got, wd, (unsigned long long)want); }
                   }
                   LOG("  %-8s %s %s\n", fp_name(keys[k]), bad ? "SALAH" : "ok", why);
                   if (bad && g_nfp_bad < 48) g_fp_bad[g_nfp_bad++] = keys[k];
