@@ -3166,6 +3166,48 @@ jobs:
           #else
           static void fpu_selftest_and_fix(void) { LOG("uji FPU dilewati (tanpa register FPR)\n"); }
           #endif
+          /* stfs di Unicorn memotong (truncate) double->float, bukan membulatkan ke terdekat seperti CPU asli
+           * (uji: -7.3 -> c0e99999, seharusnya c0e9999a).  Perbaikan opsional: LUXOR_STFS_FIX=1 (default) */
+          static unsigned long g_stfs_calls;
+          static void hook_stfs(uc_engine *uc, uint64_t addr, uint32_t size, void *ud)
+          {
+              (void)uc; (void)size; (void)ud;
+              uint32_t w = rd32((uint32_t)addr), op = w >> 26;
+              int rs = (w >> 21) & 31, ra = (w >> 16) & 31, rb = (w >> 11) & 31;
+              uint32_t ea;
+              if (op == 52 || op == 53) { int32_t d = (int16_t)(w & 0xffff); ea = (ra ? R(ra) : 0) + (uint32_t)d; }
+              else ea = (ra ? R(ra) : 0) + R(rb);
+              float f = (float)F(rs);
+              uint32_t u; memcpy(&u, &f, 4);
+              uint8_t *p = g2h(ea, 4);
+              if (!p) return;                               /* biarkan emulator yang menangani (akan error) */
+              wbe32(p, u);
+              if (op == 53 || (op == 31 && ((w >> 1) & 0x3ff) == 695)) W(ra, ea);
+              g_stfs_calls++; g_fpemu_total++;
+              WPC((uint32_t)addr + 4);
+          }
+          static void install_stfs_fix(void)
+          {
+              const char *e = getenv("LUXOR_STFS_FIX");
+              if (e && atoi(e) == 0) { LOG("[stfs] perbaikan pembulatan dimatikan\n"); return; }
+              unsigned total = 0;
+              for (int i = 0; i < g_nimg; i++) {
+                  Image *im = g_img[i];
+                  if (strcmp(im->short_name, "Luxor") && strcmp(im->short_name, "gfx2d") && strcmp(im->short_name, "ui2") && strcmp(im->short_name, "core")) continue;
+                  for (int s = 0; s < im->nsects; s++) {
+                      Sect *t = &im->sects[s];
+                      if (strcmp(t->name, "__text")) continue;
+                      uint32_t base = t->addr + im->slide;
+                      for (uint32_t o = 0; o + 4 <= t->size; o += 4) {
+                          uint32_t w = rd32(base + o), op = w >> 26, xo = (w >> 1) & 0x3ff;
+                          if (!(op == 52 || op == 53 || (op == 31 && (xo == 663 || xo == 695)))) continue;
+                          uc_hook h;
+                          if (uc_hook_add(g_uc, &h, UC_HOOK_CODE, (void *)hook_stfs, NULL, base + o, base + o) == UC_ERR_OK) total++;
+                      }
+                  }
+              }
+              LOG("[stfs] %u instruksi stfs (Luxor/gfx2d/ui2/core) dibulatkan dengan benar oleh loader\n", total);
+          }
           static void install_game_hooks(void)
           {
               uint32_t a = 0;
@@ -3261,7 +3303,7 @@ jobs:
               }
               { const char *e = getenv("LUXOR_DEBUG"); if (e && atoi(e)) g_blocktrace = 1; }
               g_logf = fopen("loader_log.txt", "w");
-              LOG("luxor_mac_loader M1 (probe) r32-fputest\napp: %s\n", app);
+              LOG("luxor_mac_loader M1 (probe) r33-stfs\napp: %s\n", app);
           #ifndef DRYRUN
               signal(SIGABRT, crash_handler);
               signal(SIGSEGV, crash_handler);
@@ -3358,6 +3400,7 @@ jobs:
               install_hooks();
               install_fcmp_fix();
               fpu_selftest_and_fix();
+              install_stfs_fix();
               if (getenv("LUXOR_DEBUG_FIXD")) install_game_hooks();
 
               /* jalankan initializer: dependensi dulu, exe terakhir */
@@ -3412,14 +3455,14 @@ jobs:
           LOADER_C_EOF
           cat > src/Luxor_Mac.sh <<'LUXOR_SH_EOF'
           #!/bin/sh
-          # Luxor Mac (PowerPC) -> Linux ARM64 | Milestone 1 | peluncur diagnostik v17 (muOS)
+          # Luxor Mac (PowerPC) -> Linux ARM64 | Milestone 1 | peluncur diagnostik v18 (muOS)
           # Skrip ini di ROMS/Ports ; folder "luxor_mac" (berisi luxor_mac_loader dan Luxor_Mac/Luxor.app)
           # dicari otomatis di beberapa lokasi umum.
           DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
           L1="$DIR/luxor_mac_launcher.txt"
 
           {
-            echo "== peluncur v17 mulai: $(date 2>&1)"
+            echo "== peluncur v18 mulai: $(date 2>&1)"
             echo "script : $0"
             echo "DIR    : $DIR"
           } > "$L1" 2>&1
@@ -3477,7 +3520,7 @@ jobs:
           # tombol kode 306 = ketik nama (LUXOR_NAME) + Enter, kode 307 = Backspace, R1 = Enter
           export LUXOR_NAME="${LUXOR_NAME:-PLAYER}"
           # langkah waktu game maks per frame (ms). Kecil = tumbukan akurat tapi game melambat saat fps rendah; 0 = nonaktif
-          export LUXOR_MAX_DT_MS="${LUXOR_MAX_DT_MS:-33}"
+          export LUXOR_MAX_DT_MS="${LUXOR_MAX_DT_MS:-0}"
           # batas waktu darurat (detik); 0 = tanpa batas. Keluar manual: SELECT+START atau tahan MENU 1 detik
           export LUXOR_TIMEOUT="${LUXOR_TIMEOUT:-0}"
           # 1 = lewati pemuatan suara (tes sampai main menu); 0 = muat suara
