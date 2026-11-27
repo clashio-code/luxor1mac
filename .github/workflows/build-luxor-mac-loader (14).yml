@@ -2416,6 +2416,16 @@ jobs:
           }
 
           /* ----------------------------------------------------------------- main */
+          /* cari simbol (termasuk simbol lokal/privat) di tabel simbol semua image */
+          static int sym_find_any(const char *name, uint32_t *addr)
+          {
+              for (int i = 0; i < g_nimg; i++) {
+                  Image *im = g_img[i];
+                  for (int k = 0; k < im->nsymrec; k++)
+                      if (im->syms[k].name && !strcmp(im->syms[k].name, name)) { *addr = im->syms[k].addr; return 1; }
+              }
+              return 0;
+          }
           /* ===== mode tanpa suara: fungsi pemuat FMOD di snd3d ditambal jadi "return 0" (gagal muat, tanpa decode) =====
            * Aktif bila env LUXOR_NOSOUND=1 (default di launcher). */
           static void patch_nosound(void)
@@ -2425,10 +2435,11 @@ jobs:
               static const char *fn[] = {
                   "_FSOUND_Sample_Load", "_FSOUND_Sample_LoadEx", "_FSOUND_Sample_LoadFromFile",
                   "_FSOUND_Stream_Open", "_FSOUND_Stream_OpenFile", "_FSOUND_Stream_OpenEx",
-                  "_FMUSIC_LoadSong", "_FMUSIC_LoadSongEx", "_FSOUND_OggVorbis_Load", NULL };
+                  "_FMUSIC_LoadSong", "_FMUSIC_LoadSongEx", "_FSOUND_OggVorbis_Load",
+                  "__ZN16snd3dSample_fmod6createEPKcb", NULL };
               for (int i = 0; fn[i]; i++) {
                   uint32_t ad = 0;
-                  if (!exp_find(fn[i], &ad) && !exp_find(fn[i] + 1, &ad)) { LOG("[nosound] %s tidak ada\n", fn[i]); continue; }
+                  if (!exp_find(fn[i], &ad) && !sym_find_any(fn[i], &ad)) { LOG("[nosound] %s tidak ada\n", fn[i]); continue; }
                   uint8_t *p = g2h(ad, 8);
                   if (!p) continue;
                   wbe32(p, 0x38600000u);        /* li r3,0 */
@@ -2460,7 +2471,7 @@ jobs:
           #endif
               }
               g_logf = fopen("loader_log.txt", "w");
-              LOG("luxor_mac_loader M1 (probe) r15-nosound\napp: %s\n", app);
+              LOG("luxor_mac_loader M1 (probe) r16-nosound2\napp: %s\n", app);
           #ifndef DRYRUN
               signal(SIGABRT, crash_handler);
               signal(SIGSEGV, crash_handler);
