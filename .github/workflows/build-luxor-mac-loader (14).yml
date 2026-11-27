@@ -625,7 +625,10 @@ jobs:
           static uint32_t heap_alloc(uint32_t n)
           {
               uint32_t sz = (n + 15) & ~15u;
-              if (g_heap_ptr + 16 + sz > HEAP_BASE + HEAP_SIZE) return 0;
+              if (g_heap_ptr + 16 + sz > HEAP_BASE + HEAP_SIZE) {
+                  static int warned; if (warned++ < 5) LOG("!! HEAP GAME PENUH: minta %u byte, terpakai %u MB dari %u MB\n", n, (unsigned)((g_heap_ptr - HEAP_BASE) >> 20), (unsigned)(HEAP_SIZE >> 20));
+                  return 0;
+              }
               uint32_t h = g_heap_ptr;
               uint8_t *p = g2h(h, 16);
               wbe32(p, n);
@@ -1862,6 +1865,16 @@ jobs:
           }
           static volatile int g_in_thr = -1;          /* tid thread guest yang sedang jalan, -1 = loop utama */
           static volatile unsigned g_slices;
+          static void ram_info(char *o, size_t n)
+          {
+              long rss_kb = -1, avail_kb = -1;
+              FILE *f = fopen("/proc/self/statm", "r");
+              if (f) { long sz, rs; if (fscanf(f, "%ld %ld", &sz, &rs) == 2) rss_kb = rs * (sysconf(_SC_PAGESIZE) / 1024); fclose(f); }
+              f = fopen("/proc/meminfo", "r");
+              if (f) { char l[128]; while (fgets(l, sizeof l, f)) if (!strncmp(l, "MemAvailable:", 13)) { avail_kb = atol(l + 13); break; } fclose(f); }
+              snprintf(o, n, "RAM proses=%ldMB bebas=%ldMB heap-game=%uMB/%uMB", rss_kb / 1024, avail_kb / 1024,
+                       (unsigned)((g_heap_ptr - HEAP_BASE) >> 20), (unsigned)(HEAP_SIZE >> 20));
+          }
           static char g_inname[16][64];
           static const char *nm_of(int *fds, int i) { (void)fds; return g_inname[i]; }
           static void *input_thread(void *ud)
@@ -1942,9 +1955,10 @@ jobs:
                   if (mono_s() - hb_t > 5.0) {
                       hb_t = mono_s();
                       unsigned bp = g_blkpos;
-                      LOG("[hb] t=%.0fs frame=%d jalan=%s slice=%u HLE=%s blok=%s\n", hb_t - t0, g_curframe,
+                      char rb[160]; ram_info(rb, sizeof rb);
+                      LOG("[hb] t=%.0fs frame=%d jalan=%s slice=%u HLE=%s blok=%s | %s\n", hb_t - t0, g_curframe,
                           g_in_thr < 0 ? "utama" : "thread", g_slices, g_lasthle ? g_lasthle : "-",
-                          describe(g_lastblk[(bp - 1) & 63]));
+                          describe(g_lastblk[(bp - 1) & 63]), rb);
                   }
                   if (sel && start) quit_now("SELECT+START");
                   if (menu && mono_s() - menu_t > 1.0) quit_now("MENU ditahan 1 detik");
@@ -2623,6 +2637,39 @@ jobs:
                   LOG("[fixD] #%u path=%d node=%d d=%g%s  dari %s\n", g_fixd_n, path, node, (double)d, bad ? "  <-- TIDAK WAJAR, dijepit ke 0" : "", describe(RLR()));
               if (bad) { g_fixd_bad++; float z = 0; memcpy(&u, &z, 4); wbe32(q, u); }
           }
+          /* pantau loop kedua fixDValue (while d < 0: node--; d += jarak) di alamat sesudah bl getNextNodeDistance */
+          static unsigned g_fixd_iter, g_fixd_cut;
+          static uint32_t g_fixd_call;
+          static void hook_fixd_loop2(uc_engine *uc, uint64_t addr, uint32_t size, void *ud)
+          {
+              (void)uc; (void)addr; (void)size; (void)ud;
+              if (g_fixd_call != g_fixd_n) { g_fixd_call = g_fixd_n; g_fixd_iter = 0; }
+              g_fixd_iter++;
+              uint32_t pd = R(30), pn = R(31);
+              uint8_t *q = g2h(pd, 4);
+              if (!q) return;
+              uint32_t u = be32(q); float d; memcpy(&d, &u, 4);
+              double dist = F(1);
+              uint32_t cr = 0;
+          #ifdef LUXOR_HAVE_CR
+              uc_reg_read(g_uc, UC_PPC_REG_CR, &cr);
+          #endif
+              if (g_fixd_iter <= 6 && g_fixd_n <= 3)
+                  LOG("[fixD]   loop2 it=%u node=%d d=%g jarak=%g cr=%08x\n", g_fixd_iter, (int)rd32(pn), (double)d, dist, cr);
+              if (g_fixd_iter > 2000) {                       /* pengaman: paksa keluar dari loop */
+                  if (g_fixd_cut++ < 10) LOG("[fixD]   loop2 >2000 putaran (node=%d d=%g jarak=%g) -> dipaksa keluar\n", (int)rd32(pn), (double)d, dist);
+                  float z = 0; memcpy(&u, &z, 4); wbe32(q, u);
+                  SF(1, 0.0);
+                  g_fixd_iter = 0;
+              }
+          }
+          /* catat argumen getNextNodeDistance(path, node) untuk beberapa panggilan pertama */
+          static unsigned g_gnd_n;
+          static void hook_gnd(uc_engine *uc, uint64_t addr, uint32_t size, void *ud)
+          {
+              (void)uc; (void)addr; (void)size; (void)ud;
+              if (g_fixd_n >= 1 && g_gnd_n < 12) { g_gnd_n++; LOG("[fixD]   getNextNodeDistance(path=%d, node=%d) this=%08x paths=%08x\n", (int)R(4), (int)R(5), R(3), rd32(R(3) + 408)); }
+          }
           static void install_game_hooks(void)
           {
               uint32_t a = 0;
@@ -2630,7 +2677,12 @@ jobs:
                   uc_hook h;
                   uc_err e = uc_hook_add(g_uc, &h, UC_HOOK_CODE, (void *)hook_fixd, NULL, a, a);
                   LOG("[fixD] hook @%08x: %s\n", a, uc_strerror(e));
+                  uc_hook h2; e = uc_hook_add(g_uc, &h2, UC_HOOK_CODE, (void *)hook_fixd_loop2, NULL, a + 0x94, a + 0x94);
+                  LOG("[fixD] hook loop2 @%08x: %s (insn %08x)\n", a + 0x94, uc_strerror(e), rd32(a + 0x94));
               } else LOG("[fixD] simbol tidak ditemukan\n");
+              if (sym_find_any("__ZNK11uiGameLevel19getNextNodeDistanceEii", &a)) {
+                  uc_hook h3; uc_hook_add(g_uc, &h3, UC_HOOK_CODE, (void *)hook_gnd, NULL, a, a);
+              }
           }
           static void install_hooks(void)
           {
@@ -2710,7 +2762,7 @@ jobs:
           #endif
               }
               g_logf = fopen("loader_log.txt", "w");
-              LOG("luxor_mac_loader M1 (probe) r20-fixd\napp: %s\n", app);
+              LOG("luxor_mac_loader M1 (probe) r21-fixd2\napp: %s\n", app);
           #ifndef DRYRUN
               signal(SIGABRT, crash_handler);
               signal(SIGSEGV, crash_handler);
