@@ -1893,6 +1893,12 @@ jobs:
               int32_t a = (int32_t)be32((const uint8_t *)x), b = (int32_t)be32((const uint8_t *)y);
               return (a > b) - (a < b);
           }
+          /* Vorbis floor1 icomp: return **(int **)a - **(int **)b  (array pointer ke int, urut naik bertanda) */
+          static int qs_deref_s32(const void *x, const void *y)
+          {
+              int32_t a = (int32_t)rd32(be32((const uint8_t *)x)), b = (int32_t)rd32(be32((const uint8_t *)y));
+              return (a > b) - (a < b);
+          }
           H(h_qsort) {
               uint32_t n = a[1], sz = a[2];
               const char *cmp = describe(a[3]);
@@ -1901,7 +1907,8 @@ jobs:
               g_qs_base = a[0];
               int (*f)(const void *, const void *) = NULL;
               if (sz == 4 && strstr(cmp, "sort32a")) f = qs_deref_u32;
-              else if (sz == 4 && (strstr(cmp, "icomp") || strstr(cmp, "int_compare"))) f = qs_s32;
+              else if (sz == 4 && strstr(cmp, "icomp")) f = qs_deref_s32;
+              else if (sz == 4 && strstr(cmp, "int_compare")) f = qs_s32;
               char k[200]; snprintf(k, sizeof k, "qsort %s", cmp);
               if (seen_first(k)) LOG("[qsort] n=%u size=%u cmp=%s -> %s\n", n, sz, cmp, f ? "ditiru di host" : "TIDAK DIKENAL (urut uint32 naik sebagai tebakan)");
               if (!f) { if (sz != 4) return 0; f = qs_u32; }
@@ -2418,7 +2425,7 @@ jobs:
           #endif
               }
               g_logf = fopen("loader_log.txt", "w");
-              LOG("luxor_mac_loader M1 (probe) r12-qsort\napp: %s\n", app);
+              LOG("luxor_mac_loader M1 (probe) r13-icomp\napp: %s\n", app);
           #ifndef DRYRUN
               signal(SIGABRT, crash_handler);
               signal(SIGSEGV, crash_handler);
