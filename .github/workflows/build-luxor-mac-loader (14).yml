@@ -2450,6 +2450,7 @@ jobs:
                       }
                   }
           }
+          static double g_frame_timeout = 900.0;   /* frame berat (mis. warmup demo menu) boleh lama */
           static void stage2(int frames)
           {
               LOG("\n===== BOOTSTRAP M2 =====\n");
@@ -2472,6 +2473,8 @@ jobs:
               LOG("timer: target=%08x selector=\"%s\" imp=%08x\n", tgt, cs(sel), loop);
               if (!loop) { LOG("tidak ada IMP untuk selector timer\n"); return; }
               { const char *e = getenv("LUXOR_THREAD_SYNC"); if (e) g_thr_sync = atoi(e); }
+              { const char *e = getenv("LUXOR_FRAME_TIMEOUT"); if (e && atof(e) > 0) g_frame_timeout = atof(e); }
+              LOG("batas waktu per frame: %.0f s\n", g_frame_timeout);
               LOG("thread guest: mode %s\n", g_thr_sync ? "sync (sampai selesai)" : "bergantian");
               for (int f = 0; frames <= 0 || f < frames; f++) {
                   g_curframe = f;
@@ -2479,7 +2482,7 @@ jobs:
                   if (f < 3) LOG("frame %d mulai\n", f);
                   cursor_step();
                   double ft0 = mono_s();
-                  r = call_guest_args(loop, tgt, sel, 0, 20.0);
+                  r = call_guest_args(loop, tgt, sel, 0, g_frame_timeout);
                   { double dt = mono_s() - ft0; if (dt > 0.5) LOG("frame %d lama: %.2fs\n", f, dt); }
                   if (r != 2) { LOG("frame %d berhenti, kode=%d (%s)\n", f, r, g_stop_reason); break; }
                   for (int ti = 0; ti < g_nthr; ti++) thread_slice(&g_thr[ti], g_thr_ms);
@@ -2673,7 +2676,7 @@ jobs:
           #endif
               }
               g_logf = fopen("loader_log.txt", "w");
-              LOG("luxor_mac_loader M1 (probe) r18-cursor\napp: %s\n", app);
+              LOG("luxor_mac_loader M1 (probe) r19-longframe\napp: %s\n", app);
           #ifndef DRYRUN
               signal(SIGABRT, crash_handler);
               signal(SIGSEGV, crash_handler);
