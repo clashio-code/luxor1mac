@@ -2017,6 +2017,7 @@ jobs:
               snprintf(o, n, "RAM proses=%ldMB bebas=%ldMB heap-game=%uMB/%uMB", rss_kb / 1024, avail_kb / 1024,
                        (unsigned)((g_heap_ptr - HEAP_BASE) >> 20), (unsigned)(HEAP_SIZE >> 20));
           }
+          static unsigned long g_hle_fetch_calls;
           static char g_inname[16][64];
           static const char *nm_of(int *fds, int i) { (void)fds; return g_inname[i]; }
           static void *input_thread(void *ud)
@@ -2105,6 +2106,7 @@ jobs:
                               LOG("[perf] %.1f fps | render %.0f%% | ke-layar %.0f%% | emulasi+lain %.0f%% | sprite cepat=%u putar=%u lambat=%u\n",
                                   df / dtv, 100 * (g_t_render - lr) / dtv, 100 * (g_t_present - lp) / dtv,
                                   100 - 100 * (g_t_render - lr + g_t_present - lp) / dtv, g_n_fast - lfa, g_n_affine - laf, g_n_slow - lsl);
+                          { static unsigned long lh; LOG("[perf]   panggilan HLE: %.0f/detik\n", (g_hle_fetch_calls - lh) / dtv); lh = g_hle_fetch_calls; }
                           lf = g_curframe; lr = g_t_render; lp = g_t_present; lt = hb_t; lfa = g_n_fast; laf = g_n_affine; lsl = g_n_slow;
                       }
                       LOG("[hb] t=%.0fs frame=%d jalan=%s slice=%u HLE=%s blok=%s | %s\n", hb_t - t0, g_curframe,
@@ -2444,6 +2446,18 @@ jobs:
                   }
                   uc_err e = uc_emu_start(g_uc, pc, 0xFFFFFFFFull, 5 * 1000000ull, 0);
                   if (g_stop) return g_stop;                      /* 1 = stop permintaan HLE, 2 = sentinel */
+                  if (e == UC_ERR_FETCH_PROT || e == UC_ERR_FETCH_UNMAPPED) {
+                      /* mode HLE "fetch": area trap tidak boleh dieksekusi, jadi setiap lompatan ke fungsi
+                       * tiruan PASTI berhenti di sini (tidak bergantung pada hook kode Unicorn yang kadang terlewat) */
+                      uint32_t fp = RPC();
+                      if (fp >= TRAP_BASE && fp < TRAP_BASE + TRAP_SIZE) {
+                          g_hle_fetch_calls++;
+                          hook_code(g_uc, fp, 4, NULL);
+                          if (g_stop) return g_stop;
+                          pc = RPC();
+                          continue;
+                      }
+                  }
                   if (e != UC_ERR_OK) {
                       char why[200];
                       snprintf(why, sizeof why, "emulator error: %s", uc_strerror(e));
@@ -2998,7 +3012,7 @@ jobs:
               }
               { const char *e = getenv("LUXOR_DEBUG"); if (e && atoi(e)) g_blocktrace = 1; }
               g_logf = fopen("loader_log.txt", "w");
-              LOG("luxor_mac_loader M1 (probe) r26-trapfix\napp: %s\n", app);
+              LOG("luxor_mac_loader M1 (probe) r27-hlefetch\napp: %s\n", app);
           #ifndef DRYRUN
               signal(SIGABRT, crash_handler);
               signal(SIGSEGV, crash_handler);
@@ -3023,6 +3037,15 @@ jobs:
               map_region("hle-data", DATA_BASE, DATA_SIZE);
               map_region("hle-trap", TRAP_BASE, TRAP_SIZE);
               wbe32(g2h(TRAP_BASE, 4), 0x4e800020);                      /* slot 0 (sentinel) = blr */
+          #ifndef DRYRUN
+              {
+                  const char *m = getenv("LUXOR_HLE_MODE");
+                  if (!m || strcmp(m, "hook")) {
+                      uc_err pe = uc_mem_protect(g_uc, TRAP_BASE, TRAP_SIZE, UC_PROT_READ | UC_PROT_WRITE);
+                      LOG("HLE mode: fetch (area trap non-exec) -> %s\n", uc_strerror(pe));
+                  } else LOG("HLE mode: hook (lama)\n");
+              }
+          #endif
               hle_state_init();
               snprintf(g_app_path, sizeof g_app_path, "%s", app);
               {
