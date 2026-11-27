@@ -717,6 +717,10 @@ jobs:
           static int g_use_r4;
           static uint32_t g_r4;
           static double g_t0;
+          /* jam game: waktu nyata dikurangi "kelebihan" tiap frame lambat, supaya langkah simulasi per frame
+           * tidak pernah melebihi g_max_dt (mencegah bola menembus bola lain saat fps rendah) */
+          static double g_time_off, g_last_frame_rt, g_max_dt = 1.0 / 30.0;
+          static unsigned long g_slow_frames;
 
           static double mono_s(void)
           {
@@ -1558,8 +1562,8 @@ jobs:
           H(h_url_fsrep)   { char *b = (char *)g2h(a[2], a[3] ? a[3] : 1); if (!b) return 0; snprintf(b, a[3], "%s/Contents/Resources", g_app_path); return 1; }
           H(h_prefs_valid) { if (a[2]) { uint8_t *p = g2h(a[2], 1); if (p) *p = 0; } return 0; }
           H(h_gestalt)     { uint8_t *p = g2h(a[1], 4); if (p) wbe32(p, a[0] == 0x73797376u ? 0x1049u : 0u); return 0; }
-          H(h_microsec)    { uint8_t *p = g2h(a[0], 8); uint64_t us = (uint64_t)((mono_s() - g_t0) * 1e6); if (p) { wbe32(p, (uint32_t)(us >> 32)); wbe32(p + 4, (uint32_t)us); } return 0; }
-          H(h_uptime)      { UNUSED; uint64_t ns = (uint64_t)((mono_s() - g_t0) * 1e9); g_r4 = (uint32_t)ns; g_use_r4 = 1; return (uint32_t)(ns >> 32); }
+          H(h_microsec)    { uint8_t *p = g2h(a[0], 8); uint64_t us = (uint64_t)((mono_s() - g_t0 - g_time_off) * 1e6); if (p) { wbe32(p, (uint32_t)(us >> 32)); wbe32(p + 4, (uint32_t)us); } return 0; }
+          H(h_uptime)      { UNUSED; uint64_t ns = (uint64_t)((mono_s() - g_t0 - g_time_off) * 1e9); g_r4 = (uint32_t)ns; g_use_r4 = 1; return (uint32_t)(ns >> 32); }
           H(h_addns)       { uint64_t s = (((uint64_t)a[0] << 32) | a[1]) + (((uint64_t)a[2] << 32) | a[3]); g_r4 = (uint32_t)s; g_use_r4 = 1; return (uint32_t)(s >> 32); }
           H(h_pixw)        { UNUSED; return 640; }
           H(h_pixh)        { UNUSED; return 480; }
@@ -2125,7 +2129,7 @@ jobs:
                               LOG("[perf] %.1f fps | render %.0f%% | ke-layar %.0f%% | emulasi+lain %.0f%% | sprite cepat=%u putar=%u lambat=%u\n",
                                   df / dtv, 100 * (g_t_render - lr) / dtv, 100 * (g_t_present - lp) / dtv,
                                   100 - 100 * (g_t_render - lr + g_t_present - lp) / dtv, g_n_fast - lfa, g_n_affine - laf, g_n_slow - lsl);
-                          { static unsigned long lh; LOG("[perf]   panggilan HLE: %.0f/detik\n", (g_hle_fetch_calls - lh) / dtv); lh = g_hle_fetch_calls; }
+                          { static double lo; LOG("[perf]   kecepatan game: %.0f%% dari normal\n", 100.0 * (dtv - (g_time_off - lo)) / dtv); lo = g_time_off; }
                           lf = g_curframe; lr = g_t_render; lp = g_t_present; lt = hb_t; lfa = g_n_fast; laf = g_n_affine; lsl = g_n_slow;
                       }
                       LOG("[hb] t=%.0fs frame=%d jalan=%s slice=%u HLE=%s blok=%s | %s\n", hb_t - t0, g_curframe,
@@ -2710,6 +2714,8 @@ jobs:
               if (!loop) { LOG("tidak ada IMP untuk selector timer\n"); return; }
               { const char *e = getenv("LUXOR_THREAD_SYNC"); if (e) g_thr_sync = atoi(e); }
               { const char *e = getenv("LUXOR_FRAME_TIMEOUT"); if (e && atof(e) > 0) g_frame_timeout = atof(e); }
+              { const char *e = getenv("LUXOR_MAX_DT_MS"); if (e) g_max_dt = atof(e) / 1000.0; }
+              LOG("langkah waktu game maks per frame: %.0f ms%s\n", g_max_dt * 1000, g_max_dt > 0 ? "" : " (nonaktif)");
               LOG("batas waktu per frame: %.0f s\n", g_frame_timeout);
               LOG("thread guest: mode %s\n", g_thr_sync ? "sync (sampai selesai)" : "bergantian");
               for (int f = 0; frames <= 0 || f < frames; f++) {
@@ -2717,6 +2723,14 @@ jobs:
                   g_trace = (f < 2);                         /* catat setiap panggilan HLE pada 2 frame pertama */
                   if (f < 3) LOG("frame %d mulai\n", f);
                   cursor_step();
+                  {   /* batasi langkah waktu game per frame */
+                      double now = mono_s();
+                      if (g_last_frame_rt > 0 && g_max_dt > 0) {
+                          double dt = now - g_last_frame_rt;
+                          if (dt > g_max_dt) { g_time_off += dt - g_max_dt; g_slow_frames++; }
+                      }
+                      g_last_frame_rt = now;
+                  }
                   double ft0 = mono_s();
                   r = call_guest_args(loop, tgt, sel, 0, g_frame_timeout);
                   { double dt = mono_s() - ft0; if (dt > 0.5) LOG("frame %d lama: %.2fs\n", f, dt); }
@@ -3064,7 +3078,7 @@ jobs:
               }
               { const char *e = getenv("LUXOR_DEBUG"); if (e && atoi(e)) g_blocktrace = 1; }
               g_logf = fopen("loader_log.txt", "w");
-              LOG("luxor_mac_loader M1 (probe) r30-keys2\napp: %s\n", app);
+              LOG("luxor_mac_loader M1 (probe) r31-maxdt\napp: %s\n", app);
           #ifndef DRYRUN
               signal(SIGABRT, crash_handler);
               signal(SIGSEGV, crash_handler);
@@ -3214,14 +3228,14 @@ jobs:
           LOADER_C_EOF
           cat > src/Luxor_Mac.sh <<'LUXOR_SH_EOF'
           #!/bin/sh
-          # Luxor Mac (PowerPC) -> Linux ARM64 | Milestone 1 | peluncur diagnostik v16 (muOS)
+          # Luxor Mac (PowerPC) -> Linux ARM64 | Milestone 1 | peluncur diagnostik v17 (muOS)
           # Skrip ini di ROMS/Ports ; folder "luxor_mac" (berisi luxor_mac_loader dan Luxor_Mac/Luxor.app)
           # dicari otomatis di beberapa lokasi umum.
           DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
           L1="$DIR/luxor_mac_launcher.txt"
 
           {
-            echo "== peluncur v16 mulai: $(date 2>&1)"
+            echo "== peluncur v17 mulai: $(date 2>&1)"
             echo "script : $0"
             echo "DIR    : $DIR"
           } > "$L1" 2>&1
@@ -3278,6 +3292,8 @@ jobs:
           # Kontrol: D-pad/stick = kursor, A = klik kiri, B = klik kanan, L1 = kursor pelan
           # tombol kode 306 = ketik nama (LUXOR_NAME) + Enter, kode 307 = Backspace, R1 = Enter
           export LUXOR_NAME="${LUXOR_NAME:-PLAYER}"
+          # langkah waktu game maks per frame (ms). Kecil = tumbukan akurat tapi game melambat saat fps rendah; 0 = nonaktif
+          export LUXOR_MAX_DT_MS="${LUXOR_MAX_DT_MS:-33}"
           # batas waktu darurat (detik); 0 = tanpa batas. Keluar manual: SELECT+START atau tahan MENU 1 detik
           export LUXOR_TIMEOUT="${LUXOR_TIMEOUT:-0}"
           # 1 = lewati pemuatan suara (tes sampai main menu); 0 = muat suara
