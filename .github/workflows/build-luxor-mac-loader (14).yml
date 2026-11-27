@@ -2103,6 +2103,7 @@ jobs:
               *pdx = dx; *pdy = dy;
           }
           static unsigned long g_hle_fetch_calls;
+          static volatile unsigned long g_hle_calls_total, g_fcmp_total;
           static volatile unsigned long g_fpemu_total;
           static unsigned long g_fpemu_calls_all(void) { return g_fpemu_total; }
           static char g_inname[16][64];
@@ -2196,6 +2197,7 @@ jobs:
                               LOG("[perf] %.1f fps | render %.0f%% | ke-layar %.0f%% | emulasi+lain %.0f%% | sprite cepat=%u putar=%u lambat=%u\n",
                                   df / dtv, 100 * (g_t_render - lr) / dtv, 100 * (g_t_present - lp) / dtv,
                                   100 - 100 * (g_t_render - lr + g_t_present - lp) / dtv, g_n_fast - lfa, g_n_affine - laf, g_n_slow - lsl);
+                          { static unsigned long lhc, lfc; LOG("[perf]   HLE: %.0f/detik | fcmpu: %.0f/detik\n", (g_hle_calls_total - lhc) / dtv, (g_fcmp_total - lfc) / dtv); lhc = g_hle_calls_total; lfc = g_fcmp_total; }
                           { static double lo; static unsigned long lfe; { double sp = 100.0 * (dtv - (g_time_off - lo)) / dtv; if (sp < 0) sp = 0; LOG("[perf]   kecepatan game: %.0f%% dari normal | FPU ditangani loader: %lu/detik\n", sp, (unsigned long)((g_fpemu_calls_all() - lfe) / dtv)); lfe = g_fpemu_calls_all(); } lo = g_time_off; }
                           lf = g_curframe; lr = g_t_render; lp = g_t_present; lt = hb_t; lfa = g_n_fast; laf = g_n_affine; lsl = g_n_slow;
                       }
@@ -2481,13 +2483,28 @@ jobs:
               if (addr == RET_SENTINEL) { g_stop = 2; uc_emu_stop(g_uc); return; }
               uint32_t idx = ((uint32_t)addr - TRAP_BASE) / 16;
               uint32_t lr = RLR();
-              for (int i = 0; i < g_nhle; i++) {
+              static int *slot2hle; static int nslot;
+              if (!slot2hle) {                                   /* indeks langsung slot -> entri HLE (dulu dicari linear tiap panggilan) */
+                  nslot = (int)(TRAP_SIZE / 16);
+                  slot2hle = (int *)malloc(sizeof(int) * (size_t)nslot);
+                  for (int i = 0; i < nslot; i++) slot2hle[i] = -1;
+                  for (int i = 0; i < g_nhle; i++) if (!g_hle[i].is_data && g_hle[i].addr >= TRAP_BASE) {
+                      uint32_t si = (g_hle[i].addr - TRAP_BASE) / 16; if (si < (uint32_t)nslot) slot2hle[si] = i;
+                  }
+              }
+              g_hle_calls_total++;
+              for (int i = (idx < (uint32_t)nslot && slot2hle[idx] >= 0) ? slot2hle[idx] : 0; i < g_nhle; i++) {
                   Hle *h = &g_hle[i];
                   if (h->is_data || h->addr != (uint32_t)addr) continue;
                   h->calls++;
                   g_lasthle = h->name;
                   uint32_t a[8];
-                  for (int k = 0; k < 8; k++) a[k] = R(3 + k);
+                  {
+                      static int ids[8]; static void *ptrs[8];
+                      if (!ids[0]) for (int k = 0; k < 8; k++) { ids[k] = UC_PPC_REG_3 + k; }
+                      for (int k = 0; k < 8; k++) ptrs[k] = &a[k];
+                      uc_reg_read_batch(g_uc, ids, ptrs, 8);
+                  }
                   if (!h->fn && h->calls <= 3)
                       LOG("[HLE-GENERIK] %s(%08x,%08x,%08x,%08x) dari %s\n", h->name, a[0], a[1], a[2], a[3], describe(lr));
                   else if (h->fn && ((g_trace && h->calls <= 40) || h->fn == h_nsappmain || h->fn == h_exit || h->fn == h_abort)) {
@@ -2522,6 +2539,7 @@ jobs:
 
           /* jalankan emulasi mulai dari pc sampai sentinel / stop / error / timeout */
           static void enable_fpu_altivec(void);
+          static int g_use_count = 0;     /* 1 = cara lama (hitung instruksi, lambat): LUXOR_EMU_COUNT=1 */
           static int run_guest(uint32_t pc, double max_seconds)
           {
               g_stop = 0;
@@ -2539,7 +2557,13 @@ jobs:
                       pc = RPC();
                       continue;
                   }
-                  uc_err e = uc_emu_start(g_uc, pc, 0xFFFFFFFFull, 5 * 1000000ull, 0);
+                  /* PENTING untuk kecepatan: parameter "count" Unicorn dipasang sebagai hook per-instruksi
+                   * (callback C di SETIAP instruksi guest).  Pakai batas waktu (timeout, mikrodetik) saja. */
+                  double left = max_seconds - (now_s() - t0);
+                  if (left < 0.001) left = 0.001;
+                  uc_err e = g_use_count
+                      ? uc_emu_start(g_uc, pc, 0xFFFFFFFFull, 5 * 1000000ull, 0)
+                      : uc_emu_start(g_uc, pc, 0xFFFFFFFFull, (uint64_t)(left * 1e6), 0);
                   if (g_stop) return g_stop;                      /* 1 = stop permintaan HLE, 2 = sentinel */
                   if (e == UC_ERR_FETCH_PROT || e == UC_ERR_FETCH_UNMAPPED) {
                       /* mode HLE "fetch": area trap tidak boleh dieksekusi, jadi setiap lompatan ke fungsi
@@ -3022,7 +3046,7 @@ jobs:
               fs = (fs & ~0xF000u) | (c << 12);
               uc_reg_write(g_uc, UC_PPC_REG_FPSCR, &fs);
           #endif
-              g_fcmp_n++;
+              g_fcmp_n++; g_fcmp_total++;
               if (old != c && g_fcmp_fix++ < 5)
                   LOG("[fcmp] %s: f%d=%g f%d=%g cr%d emulator=%x -> benar=%x\n", describe((uint32_t)addr), fa, a, fb, b, crf, old, c);
               WPC((uint32_t)addr + 4);
@@ -3367,8 +3391,9 @@ jobs:
           #endif
               }
               { const char *e = getenv("LUXOR_DEBUG"); if (e && atoi(e)) g_blocktrace = 1; }
+              { const char *e = getenv("LUXOR_EMU_COUNT"); if (e && atoi(e)) g_use_count = 1; }
               g_logf = fopen("loader_log.txt", "w");
-              LOG("luxor_mac_loader M1 (probe) r35-cursor60b\napp: %s\n", app);
+              LOG("luxor_mac_loader M1 (probe) r36-fastemu\napp: %s\n", app);
           #ifndef DRYRUN
               signal(SIGABRT, crash_handler);
               signal(SIGSEGV, crash_handler);
