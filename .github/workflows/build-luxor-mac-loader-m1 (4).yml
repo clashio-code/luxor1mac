@@ -1,0 +1,103 @@
+name: build-luxor-mac-loader-m1
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "**/loader.c"
+      - ".github/workflows/build-luxor-mac-loader-m1.yml"
+
+jobs:
+  build:
+    # runner ARM64 native supaya hasilnya langsung ARM64 (RG40XXV)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cek isi repo
+        run: |
+          echo "--- file di repo ---"
+          find . -type f -not -path './.git/*' | sort | head -50
+          SRC=$(find . -name loader.c -not -path './unicorn/*' | head -1)
+          echo "loader.c ditemukan di: '${SRC}'"
+          test -n "$SRC" || { echo "ERROR: loader.c tidak ada di repo. Commit file loader.c dulu."; exit 1; }
+
+      - name: Pasang tool build
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake git python3
+
+      - name: Build Unicorn (hanya PPC, statis)
+        run: |
+          git clone --depth 1 --branch 2.1.1 https://github.com/unicorn-engine/unicorn.git
+          cmake -S unicorn -B unicorn/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DUNICORN_ARCH=ppc \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DUNICORN_BUILD_TESTS=OFF
+          cmake --build unicorn/build -j"$(nproc)"
+          find unicorn/build -name '*.a'
+
+      - name: Diagnostik header PPC Unicorn
+        run: |
+          echo "--- register PPC ---"
+          grep -nE "UC_PPC_REG_(PC|0|1|3|31|LR|CTR|MSR)\b" unicorn/include/unicorn/ppc.h || true
+          echo "--- register FPR ---"
+          grep -nE "UC_PPC_REG_FPR(0|1|2)\b" unicorn/include/unicorn/ppc.h || echo "(tidak ada)"
+          echo "--- kontrol buffer TCG di unicorn.h ---"
+          grep -nE "TCG_BUFFER|tcg_buffer" unicorn/include/unicorn/unicorn.h || echo "(tidak ada)"
+          echo "--- semua model CPU PPC32 ---"
+          grep -oE 'UC_CPU_PPC32_[A-Za-z0-9_]+' unicorn/include/unicorn/ppc.h | sort -u || true
+
+      - name: Build loader
+        run: |
+          SRC=$(find . -name loader.c -not -path './unicorn/*' | head -1)
+          echo "Sumber: $SRC"
+          grep -oE 'UC_CPU_PPC32_[A-Za-z0-9_]+' unicorn/include/unicorn/ppc.h | sort -u > models.txt || true
+          MODEL=""
+          for pat in 7447A 7447 7457 7450 7455 7410 7400 750 745; do
+            m=$(grep -E "UC_CPU_PPC32_${pat}(_|$)" models.txt | head -1 || true)
+            if [ -n "$m" ]; then MODEL="$m"; break; fi
+          done
+          echo "Model CPU terpilih: '${MODEL}'"
+          EXTRA=()
+          if [ -n "$MODEL" ]; then
+            EXTRA=("-DLUXOR_CPU_MODEL=$MODEL" "-DLUXOR_CPU_MODEL_STR=\"$MODEL\"")
+          fi
+          if grep -q "UC_PPC_REG_FPR0" unicorn/include/unicorn/ppc.h; then
+            EXTRA+=("-DLUXOR_HAVE_FPR")
+            echo "Register FPR: ada"
+          else
+            echo "Register FPR: TIDAK ada di header (fungsi math dinonaktifkan)"
+          fi
+          if grep -q "uc_ctl_set_tcg_buffer_size" unicorn/include/unicorn/unicorn.h; then
+            EXTRA+=("-DHAVE_TCG_BUFFER_CTL")
+            echo "Kontrol buffer TCG: ada"
+          else
+            echo "Kontrol buffer TCG: TIDAK ada di header"
+          fi
+          mkdir -p out
+          gcc -O2 -Wall -Iunicorn/include "${EXTRA[@]}" "$SRC" -o out/luxor_mac_loader \
+            -static -Wl,--start-group $(find unicorn/build -name '*.a' | tr '\n' ' ') -Wl,--end-group -lpthread -lm
+          strip out/luxor_mac_loader
+          file out/luxor_mac_loader
+          ls -l out/luxor_mac_loader
+
+      - name: Uji jalan (harus gagal rapi karena tidak ada game di sini)
+        run: |
+          cd out
+          ./luxor_mac_loader /tidak/ada/Luxor.app || true
+          cat loader_log.txt || true
+          rm -f loader_log.txt
+
+      - name: Siapkan paket
+        run: |
+          SH=$(find . -name Luxor_Mac.sh -not -path './unicorn/*' -not -path './out/*' | head -1)
+          if [ -n "$SH" ]; then cp "$SH" out/Luxor_Mac.sh; fi
+          chmod +x out/* || true
+          ls -l out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: luxor-mac-loader-m1
+          path: out/
