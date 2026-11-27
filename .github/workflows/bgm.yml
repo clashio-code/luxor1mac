@@ -2434,7 +2434,7 @@ jobs:
               if (run) {                        /* thread FMOD (stream/async) dijalankan bergantian sedikit tiap frame */
                   GThread *t = &g_thr[g_nthr++]; memset(t, 0, sizeof *t);
                   t->fn = a[0]; t->arg = a[1]; t->tid = tid; t->coop = 1;
-                  const char *e = getenv("LUXOR_AU_THREAD_MS"); t->slice_ms = e ? atof(e) : 150.0;   /* batas cadangan; normalnya berhenti di yield */
+                  const char *e = getenv("LUXOR_AU_THREAD_MS"); t->slice_ms = e ? atof(e) : 3000.0;  /* batas darurat saja: memotong thread lewat timeout Unicorn TIDAK aman */
               }
               SNDLOG("[snd] MPCreateTask(entry=%s, param=%08x, stack=%u) -> task %x (%s)\n", describe(a[0]), a[1], a[2], tid, run ? "dijalankan bergantian" : "TIDAK dijalankan");
               return 0;
@@ -2914,7 +2914,10 @@ jobs:
               if (g_stop == 2) { t->done = 1; LOG("[thread] tid %x selesai normal (%.1f s CPU)\n", t->tid, t->used); }
               else if (g_stop == 1) { t->done = 1; LOG("[thread] tid %x berhenti: %s\n", t->tid, g_stop_reason); }
               else if (e != UC_ERR_OK) { t->done = 1; char why[120]; snprintf(why, sizeof why, "thread %x: %s", t->tid, uc_strerror(e)); dump_state(why); }
-              else { uc_context_save(g_uc, (uc_context *)t->ctx); regs_save(t); }
+              else {
+                  if (t->coop) { static int nw; if (nw++ < 5) LOG("[thread] PERINGATAN: thread FMOD %x dipotong paksa setelah %.0f ms (bisa merusak state)\n", t->tid, ms); }
+                  uc_context_save(g_uc, (uc_context *)t->ctx); regs_save(t);
+              }
               g_stop = 0;
           }
 
@@ -3826,7 +3829,7 @@ jobs:
               { const char *e = getenv("LUXOR_DEBUG"); if (e && atoi(e)) g_blocktrace = 1; }
               { const char *e = getenv("LUXOR_EMU_COUNT"); if (e && atoi(e)) g_use_count = 1; }
               g_logf = fopen("loader_log.txt", "w");
-              LOG("luxor_mac_loader M1 (probe) r48-bgmyield\napp: %s\n", app);
+              LOG("luxor_mac_loader M1 (probe) r49-bgmnocut\napp: %s\n", app);
           #ifndef DRYRUN
               signal(SIGABRT, crash_handler);
               signal(SIGSEGV, crash_handler);
