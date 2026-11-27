@@ -2038,6 +2038,8 @@ jobs:
                        (unsigned)((g_heap_ptr - HEAP_BASE) >> 20), (unsigned)(HEAP_SIZE >> 20));
           }
           static unsigned long g_hle_fetch_calls;
+          static volatile unsigned long g_fpemu_total;
+          static unsigned long g_fpemu_calls_all(void) { return g_fpemu_total; }
           static char g_inname[16][64];
           static const char *nm_of(int *fds, int i) { (void)fds; return g_inname[i]; }
           static void *input_thread(void *ud)
@@ -2129,7 +2131,7 @@ jobs:
                               LOG("[perf] %.1f fps | render %.0f%% | ke-layar %.0f%% | emulasi+lain %.0f%% | sprite cepat=%u putar=%u lambat=%u\n",
                                   df / dtv, 100 * (g_t_render - lr) / dtv, 100 * (g_t_present - lp) / dtv,
                                   100 - 100 * (g_t_render - lr + g_t_present - lp) / dtv, g_n_fast - lfa, g_n_affine - laf, g_n_slow - lsl);
-                          { static double lo; LOG("[perf]   kecepatan game: %.0f%% dari normal\n", 100.0 * (dtv - (g_time_off - lo)) / dtv); lo = g_time_off; }
+                          { static double lo; static unsigned long lfe; { double sp = 100.0 * (dtv - (g_time_off - lo)) / dtv; if (sp < 0) sp = 0; LOG("[perf]   kecepatan game: %.0f%% dari normal | FPU ditangani loader: %lu/detik\n", sp, (unsigned long)((g_fpemu_calls_all() - lfe) / dtv)); lfe = g_fpemu_calls_all(); } lo = g_time_off; }
                           lf = g_curframe; lr = g_t_render; lp = g_t_present; lt = hb_t; lfa = g_n_fast; laf = g_n_affine; lsl = g_n_slow;
                       }
                       LOG("[hb] t=%.0fs frame=%d jalan=%s slice=%u HLE=%s blok=%s | %s\n", hb_t - t0, g_curframe,
@@ -2983,6 +2985,187 @@ jobs:
               }
               LOG("[fcmp] %u instruksi fcmpu/fcmpo ditangani loader\n", total);
           }
+          #if defined(LUXOR_HAVE_FPR)
+          /* ===================== uji mandiri FPU Unicorn + perbaikan otomatis =====================
+           * fcmpu terbukti salah di Unicorn. Di sini setiap instruksi floating-point dicoba sekali di emulator
+           * dengan nilai uji, dibandingkan dengan hasil host.  Instruksi yang salah lalu ditangani loader
+           * (di-hook per alamat di __text, dihitung di host) seperti perbaikan fcmpu. */
+          static uint64_t Fbits(int i) { uint64_t v = 0; uc_reg_read(g_uc, UC_PPC_REG_FPR0 + i, &v); return v; }
+          static void SFbits(int i, uint64_t v) { uc_reg_write(g_uc, UC_PPC_REG_FPR0 + i, &v); }
+          static double bits2d(uint64_t b) { double d; memcpy(&d, &b, 8); return d; }
+          static uint64_t d2bits(double d) { uint64_t b; memcpy(&b, &d, 8); return b; }
+          static int fp_is_aform(uint32_t op, uint32_t xo5)
+          {
+              if (op == 59) return xo5 == 18 || xo5 == 20 || xo5 == 21 || xo5 == 22 || xo5 == 24 || xo5 == 25 || (xo5 >= 28 && xo5 <= 31);
+              if (op == 63) return xo5 == 18 || xo5 == 20 || xo5 == 21 || xo5 == 22 || xo5 == 23 || xo5 == 25 || xo5 == 26 || (xo5 >= 28 && xo5 <= 31);
+              return 0;
+          }
+          /* kunci jenis instruksi: op<<16 | xo (xo5 untuk A-form, xo10 untuk X-form) */
+          static uint32_t fp_key(uint32_t w)
+          {
+              uint32_t op = w >> 26, xo5 = (w >> 1) & 31, xo10 = (w >> 1) & 0x3ff;
+              if (op != 59 && op != 63) return 0;
+              if (fp_is_aform(op, xo5)) return (op << 16) | xo5;
+              if (op == 63 && (xo10 == 12 || xo10 == 14 || xo10 == 15 || xo10 == 40 || xo10 == 72 || xo10 == 136 || xo10 == 264)) return (op << 16) | 0x8000 | xo10;
+              return 0;
+          }
+          /* hitung hasil instruksi di host; return 0 bila jenis tidak dikenal */
+          static int fp_eval(uint32_t w, uint64_t *res)
+          {
+              uint32_t op = w >> 26, xo5 = (w >> 1) & 31, xo10 = (w >> 1) & 0x3ff;
+              int ra = (w >> 16) & 31, rb = (w >> 11) & 31, rc = (w >> 6) & 31;
+              double a = F(ra), b = F(rb), c = F(rc), r;
+              if (fp_is_aform(op, xo5)) {
+                  switch (xo5) {
+                  case 18: r = a / b; break;
+                  case 20: r = a - b; break;
+                  case 21: r = a + b; break;
+                  case 22: r = sqrt(b); break;
+                  case 23: *res = (a >= 0.0) ? Fbits(rc) : Fbits(rb); return 1;      /* fsel */
+                  case 24: r = 1.0 / b; break;
+                  case 25: r = a * c; break;
+                  case 26: r = 1.0 / sqrt(b); break;
+                  case 28: r = fma(a, c, -b); break;
+                  case 29: r = fma(a, c, b); break;
+                  case 30: r = -fma(a, c, -b); break;
+                  case 31: r = -fma(a, c, b); break;
+                  default: return 0;
+                  }
+                  if (op == 59) r = (double)(float)r;
+                  *res = d2bits(r);
+                  return 1;
+              }
+              if (op != 63) return 0;
+              uint64_t bb = Fbits(rb);
+              switch (xo10) {
+              case 12: *res = d2bits((double)(float)b); return 1;                      /* frsp */
+              case 14: case 15: {                                                      /* fctiw / fctiwz */
+                  double v = xo10 == 15 ? trunc(b) : nearbyint(b);
+                  uint32_t iv = isnan(v) ? 0x80000000u : v > 2147483647.0 ? 0x7fffffffu : v < -2147483648.0 ? 0x80000000u : (uint32_t)(int32_t)v;
+                  *res = 0xFFF8000000000000ull | iv; return 1;
+              }
+              case 40:  *res = bb ^ 0x8000000000000000ull; return 1;                  /* fneg */
+              case 72:  *res = bb; return 1;                                           /* fmr */
+              case 136: *res = bb | 0x8000000000000000ull; return 1;                  /* fnabs */
+              case 264: *res = bb & ~0x8000000000000000ull; return 1;                 /* fabs */
+              }
+              return 0;
+          }
+          static uint32_t g_fp_bad[48];
+          static int g_nfp_bad;
+          static unsigned long g_fpemu_calls;
+          static void hook_fpemu(uc_engine *uc, uint64_t addr, uint32_t size, void *ud)
+          {
+              (void)uc; (void)size; (void)ud;
+              uint32_t w = rd32((uint32_t)addr);
+              uint64_t r;
+              if (!fp_eval(w, &r)) return;
+              SFbits((w >> 21) & 31, r);
+              g_fpemu_calls++; g_fpemu_total++;
+              WPC((uint32_t)addr + 4);
+          }
+          static const char *fp_name(uint32_t k)
+          {
+              static char b[24];
+              uint32_t op = k >> 16, x = k & 0x7fff;
+              static const char *a63[32] = { [18]="fdiv",[20]="fsub",[21]="fadd",[22]="fsqrt",[23]="fsel",[25]="fmul",[26]="frsqrte",[28]="fmsub",[29]="fmadd",[30]="fnmsub",[31]="fnmadd" };
+              static const char *a59[32] = { [18]="fdivs",[20]="fsubs",[21]="fadds",[22]="fsqrts",[24]="fres",[25]="fmuls",[28]="fmsubs",[29]="fmadds",[30]="fnmsubs",[31]="fnmadds" };
+              if (k & 0x8000) {
+                  switch (x) { case 12: return "frsp"; case 14: return "fctiw"; case 15: return "fctiwz"; case 40: return "fneg"; case 72: return "fmr"; case 136: return "fnabs"; case 264: return "fabs"; }
+              } else if (x < 32) { const char *n = op == 59 ? a59[x] : a63[x]; if (n) return n; }
+              snprintf(b, sizeof b, "op%u/%u", op, x);
+              return b;
+          }
+          static void fpu_selftest_and_fix(void)
+          {
+              const char *e = getenv("LUXOR_FPFIX");
+              int fix = !(e && atoi(e) == 0);
+              static const double V[][3] = { {3.0, 1.5, 2.0}, {-0.75, 2.5, 4.0}, {0.001, 7.25, -3.5}, {100.25, -0.5, 0.125},
+                                             {12345.678, 0.3, -1.0e-3}, {-2.0, 2.5, 0.5}, {0.0, -3.75, 9.0} };
+              static const uint32_t A63[] = {18, 20, 21, 22, 23, 25, 26, 28, 29, 30, 31}, A59[] = {18, 20, 21, 22, 24, 25, 28, 29, 30, 31}, X63[] = {12, 14, 15, 40, 72, 136, 264};
+              uint32_t keys[64]; uint32_t insns[64]; int nk = 0;
+              for (size_t i = 0; i < sizeof A63 / 4; i++) { keys[nk] = (63u << 16) | A63[i]; insns[nk++] = (63u << 26) | (A63[i] << 1); }
+              for (size_t i = 0; i < sizeof A59 / 4; i++) { keys[nk] = (59u << 16) | A59[i]; insns[nk++] = (59u << 26) | (A59[i] << 1); }
+              for (size_t i = 0; i < sizeof X63 / 4; i++) { keys[nk] = (63u << 16) | 0x8000 | X63[i]; insns[nk++] = (63u << 26) | (4u << 21) | (2u << 11) | (X63[i] << 1); }
+              uint32_t scratch = heap_alloc(64);
+              LOG("== Uji mandiri FPU Unicorn ==\n");
+              for (int k = 0; k < nk; k++) {
+                  uint32_t w = insns[k];
+                  if (!(keys[k] & 0x8000)) {
+                      uint32_t x = keys[k] & 31;
+                      int useA = !(x == 22 || x == 24 || x == 26), useB = (x != 25), useC = (x == 25 || x == 23 || x >= 28);
+                      w |= 4u << 21;
+                      if (useA) w |= 1u << 16;
+                      if (useB) w |= 2u << 11;
+                      if (useC) w |= 3u << 6;
+                  }
+                  int bad = 0; char why[200] = "";
+                  for (size_t t = 0; t < sizeof V / sizeof V[0] && !bad; t++) {
+                      double a = V[t][0], b = V[t][1], c = V[t][2];
+                      uint32_t x = keys[k] & 0x7fff;
+                      if (!(keys[k] & 0x8000) && (x == 22 || x == 24 || x == 26)) b = fabs(b) + 0.5;
+                      uint32_t code = heap_alloc(16);                  /* alamat baru tiap uji (hindari cache JIT) */
+                      uint8_t *p = g2h(code, 8); wbe32(p, w); wbe32(p + 4, 0x4e800020u);
+                      SF(1, a); SF(2, b); SF(3, c); SFbits(4, 0x7ff8deadbeef0000ull);
+                      W(3, scratch); W(1, INIT_SP); WLR(RET_SENTINEL);
+                      int rr = run_guest(code, 1.0);
+                      if (rr != 2) { bad = 1; snprintf(why, sizeof why, "eksekusi gagal (kode %d)", rr); break; }
+                      uint64_t got = Fbits(4), want = 0;
+                      SF(1, a); SF(2, b); SF(3, c);
+                      uint32_t wr = (w & ~(31u << 21)) | (4u << 21);
+                      fp_eval(wr, &want);
+                      double gd = bits2d(got), wd = bits2d(want);
+                      int ok;
+                      if (keys[k] & 0x8000) ok = (got == want) || ((x == 14 || x == 15) && (uint32_t)got == (uint32_t)want);
+                      else if (x == 24) ok = fabs(gd - wd) <= fabs(wd) / 200.0;
+                      else if (x == 26) ok = fabs(gd - wd) <= fabs(wd) / 30.0;
+                      else if ((keys[k] >> 16) == 59) ok = (got == want) || fabs(gd - wd) <= fabs(wd) * 2e-7;
+                      else ok = (got == want) || fabs(gd - wd) <= fabs(wd) * 1e-15;
+                      if (!ok) { bad = 1; snprintf(why, sizeof why, "a=%g b=%g c=%g -> emulator %.9g (%016llx), seharusnya %.9g", a, b, c, gd, (unsigned long long)got, wd, (unsigned long long)want); }
+                  }
+                  LOG("  %-8s %s %s\n", fp_name(keys[k]), bad ? "SALAH" : "ok", why);
+                  if (bad && g_nfp_bad < 48) g_fp_bad[g_nfp_bad++] = keys[k];
+              }
+              /* lfs / stfs */
+              {
+                  float fv = 1.1f; uint32_t fb; memcpy(&fb, &fv, 4);
+                  wbe32(g2h(scratch, 4), fb);
+                  uint32_t code = heap_alloc(16); uint8_t *p = g2h(code, 8);
+                  wbe32(p, (48u << 26) | (4u << 21) | (3u << 16)); wbe32(p + 4, 0x4e800020u);
+                  W(3, scratch); W(1, INIT_SP); WLR(RET_SENTINEL); run_guest(code, 1.0);
+                  LOG("  %-8s %s (%.9g)\n", "lfs", F(4) == (double)fv ? "ok" : "SALAH", F(4));
+                  code = heap_alloc(16); p = g2h(code, 8);
+                  wbe32(p, (52u << 26) | (1u << 21) | (3u << 16)); wbe32(p + 4, 0x4e800020u);
+                  SF(1, -7.3); W(3, scratch); W(1, INIT_SP); WLR(RET_SENTINEL); run_guest(code, 1.0);
+                  uint32_t got = rd32(scratch); float want = -7.3f; uint32_t wb; memcpy(&wb, &want, 4);
+                  LOG("  %-8s %s (%08x vs %08x)\n", "stfs", got == wb ? "ok" : "SALAH", got, wb);
+              }
+              LOG("hasil uji FPU: %d jenis instruksi salah\n", g_nfp_bad);
+              if (!g_nfp_bad || !fix) { if (g_nfp_bad) LOG("perbaikan FPU dimatikan (LUXOR_FPFIX=0)\n"); return; }
+              unsigned cnt[48] = {0}, total = 0;
+              for (int i = 0; i < g_nimg; i++) {
+                  Image *im = g_img[i];
+                  for (int s = 0; s < im->nsects; s++) {
+                      Sect *t = &im->sects[s];
+                      if (strcmp(t->name, "__text")) continue;
+                      uint32_t base = t->addr + im->slide;
+                      for (uint32_t o = 0; o + 4 <= t->size; o += 4) {
+                          uint32_t w = rd32(base + o), k = fp_key(w);
+                          if (!k) continue;
+                          for (int b = 0; b < g_nfp_bad; b++) if (g_fp_bad[b] == k) {
+                              uc_hook h;
+                              if (uc_hook_add(g_uc, &h, UC_HOOK_CODE, (void *)hook_fpemu, NULL, base + o, base + o) == UC_ERR_OK) { cnt[b]++; total++; }
+                              break;
+                          }
+                      }
+                  }
+              }
+              for (int b = 0; b < g_nfp_bad; b++) LOG("  perbaikan %-8s: %u lokasi\n", fp_name(g_fp_bad[b]), cnt[b]);
+              LOG("perbaikan FPU: %u instruksi ditangani loader\n", total);
+          }
+          #else
+          static void fpu_selftest_and_fix(void) { LOG("uji FPU dilewati (tanpa register FPR)\n"); }
+          #endif
           static void install_game_hooks(void)
           {
               uint32_t a = 0;
@@ -3078,7 +3261,7 @@ jobs:
               }
               { const char *e = getenv("LUXOR_DEBUG"); if (e && atoi(e)) g_blocktrace = 1; }
               g_logf = fopen("loader_log.txt", "w");
-              LOG("luxor_mac_loader M1 (probe) r31-maxdt\napp: %s\n", app);
+              LOG("luxor_mac_loader M1 (probe) r32-fputest\napp: %s\n", app);
           #ifndef DRYRUN
               signal(SIGABRT, crash_handler);
               signal(SIGSEGV, crash_handler);
@@ -3174,6 +3357,7 @@ jobs:
               enable_fpu_altivec();
               install_hooks();
               install_fcmp_fix();
+              fpu_selftest_and_fix();
               if (getenv("LUXOR_DEBUG_FIXD")) install_game_hooks();
 
               /* jalankan initializer: dependensi dulu, exe terakhir */
