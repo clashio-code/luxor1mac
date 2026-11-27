@@ -647,7 +647,7 @@ jobs:
           static volatile unsigned g_blkpos;
           static const char *volatile g_lasthle;
           static volatile int g_curframe = -1;
-          static int g_blocktrace = 1;
+          static int g_blocktrace = 0;     /* aktif bila LUXOR_DEBUG=1 (mahal: dipanggil tiap blok kode) */
           static volatile uint32_t g_lastins[256];
           static volatile unsigned g_inspos;
           static int g_insntrace = 0;
@@ -1578,9 +1578,16 @@ jobs:
           static int g_nvb;
           static uint32_t g_prim;
 
+          static void fbdev_open(void);
+          static int g_native_res = 1;          /* 1 = render langsung di resolusi layar (lebih cepat) */
+          static int g_fb_w0, g_fb_h0;          /* ukuran layar fisik bila tersedia */
           static void fb_ensure(void)
           {
               if (!g_fb) {
+                  if (g_native_res) {
+                      fbdev_open();
+                      if (g_fb_w0 > 0 && g_fb_h0 > 0) { g_scr_w = g_fb_w0; g_scr_h = g_fb_h0; }
+                  }
                   g_fb = (uint32_t *)calloc((size_t)g_scr_w * g_scr_h, 4);
                   LOG("[gl] framebuffer software %dx%d dibuat\n", g_scr_w, g_scr_h);
               }
@@ -1714,6 +1721,64 @@ jobs:
                   }
               }
           }
+          /* jalur cepat: quad sejajar sumbu (hampir semua sprite 2D Luxor) digambar dengan aritmetika integer */
+          static int fast_quad(GTex *tx, int rect)
+          {
+              if (g_nvb != 4 || (g_prim != 5 && g_prim != 7 && g_prim != 6 && g_prim != 9)) return 0;
+              GV *v = g_vb;
+              float mnx = v[0].x, mxx = v[0].x, mny = v[0].y, mxy = v[0].y;
+              for (int i = 1; i < 4; i++) { mnx = fminf(mnx, v[i].x); mxx = fmaxf(mxx, v[i].x); mny = fminf(mny, v[i].y); mxy = fmaxf(mxy, v[i].y); }
+              if (mxx - mnx < 0.5f || mxy - mny < 0.5f) return 1;
+              float u0 = 0, u1 = 0, v0 = 0, v1 = 0; int gu0 = 0, gu1 = 0, gv0 = 0, gv1 = 0;
+              for (int i = 0; i < 4; i++) {
+                  int ax = fabsf(v[i].x - mnx) < 0.01f ? 0 : fabsf(v[i].x - mxx) < 0.01f ? 1 : -1;
+                  int ay = fabsf(v[i].y - mny) < 0.01f ? 0 : fabsf(v[i].y - mxy) < 0.01f ? 1 : -1;
+                  if (ax < 0 || ay < 0) return 0;                                   /* terputar / miring */
+                  if (ax == 0) { if (gu0 && u0 != v[i].u) return 0; u0 = v[i].u; gu0 = 1; } else { if (gu1 && u1 != v[i].u) return 0; u1 = v[i].u; gu1 = 1; }
+                  if (ay == 0) { if (gv0 && v0 != v[i].v) return 0; v0 = v[i].v; gv0 = 1; } else { if (gv1 && v1 != v[i].v) return 0; v1 = v[i].v; gv1 = 1; }
+                  for (int k = 0; k < 4; k++) if (v[i].c[k] != v[0].c[k]) return 0;  /* warna harus seragam */
+              }
+              if (!gu0 || !gu1 || !gv0 || !gv1) return 0;
+              int blend = g_en_blend;
+              if (blend && !(g_bsrc == 0x302 && g_bdst == 0x303) && !(g_bsrc == 1 && g_bdst == 0) && !(g_bsrc == 0x302 && g_bdst == 1) && !(g_bsrc == 1 && g_bdst == 0x303)) return 0;
+              int x0 = (int)floorf(mnx + 0.5f), x1 = (int)floorf(mxx + 0.5f), y0 = (int)floorf(mny + 0.5f), y1 = (int)floorf(mxy + 0.5f);
+              float W = mxx - mnx, Hh = mxy - mny;
+              int tw = tx && tx->px ? tx->w : 1, th = tx && tx->px ? tx->h : 1;
+              double su = rect ? 1.0 : tw, sv = rect ? 1.0 : th;
+              /* u(x) = u0 + (x + 0.5 - mnx) * (u1-u0)/W, dalam fixed point 16.16 texel */
+              int64_t du = (int64_t)(((u1 - u0) / W) * su * 65536.0), dv = (int64_t)(((v1 - v0) / Hh) * sv * 65536.0);
+              int64_t ub = (int64_t)((u0 * su + (x0 + 0.5 - mnx) * ((u1 - u0) / W) * su) * 65536.0);
+              int64_t vb = (int64_t)((v0 * sv + (y0 + 0.5 - mny) * ((v1 - v0) / Hh) * sv) * 65536.0);
+              if (x0 < 0) { ub += du * (int64_t)(-x0); x0 = 0; }
+              if (y0 < 0) { vb += dv * (int64_t)(-y0); y0 = 0; }
+              if (x1 > g_scr_w) x1 = g_scr_w;
+              if (y1 > g_scr_h) y1 = g_scr_h;
+              int cr = (int)(v[0].c[0] * 255 + 0.5f), cg = (int)(v[0].c[1] * 255 + 0.5f), cb = (int)(v[0].c[2] * 255 + 0.5f), ca = (int)(v[0].c[3] * 255 + 0.5f);
+              int white = cr == 255 && cg == 255 && cb == 255 && ca == 255;
+              for (int y = y0; y < y1; y++, vb += dv) {
+                  int iv = (int)(vb >> 16); if (iv < 0) iv = 0; if (iv >= th) iv = th - 1;
+                  const uint32_t *trow = (tx && tx->px) ? tx->px + (size_t)iv * tw : NULL;
+                  uint32_t *d = g_fb + (size_t)y * g_scr_w;
+                  int64_t u = ub;
+                  for (int x = x0; x < x1; x++, u += du) {
+                      uint32_t s;
+                      if (trow) { int iu = (int)(u >> 16); if (iu < 0) iu = 0; if (iu >= tw) iu = tw - 1; s = trow[iu]; }
+                      else s = 0xffffffffu;
+                      uint32_t sa = s >> 24, sr = (s >> 16) & 255, sg = (s >> 8) & 255, sb = s & 255;
+                      if (!white) { sr = sr * cr / 255; sg = sg * cg / 255; sb = sb * cb / 255; sa = sa * ca / 255; }
+                      if (!blend || (g_bsrc == 1 && g_bdst == 0)) { d[x] = (sa << 24) | (sr << 16) | (sg << 8) | sb; continue; }
+                      uint32_t p = d[x], dr = (p >> 16) & 255, dg = (p >> 8) & 255, db = p & 255;
+                      uint32_t fs = (g_bsrc == 1) ? 255 : sa, fd = (g_bdst == 1) ? 255 : 255 - sa;
+                      if (fs == 0 && fd == 255) continue;
+                      uint32_t r = (sr * fs + dr * fd) / 255, g = (sg * fs + dg * fd) / 255, b = (sb * fs + db * fd) / 255;
+                      if (r > 255) r = 255;
+                      if (g > 255) g = 255;
+                      if (b > 255) b = 255;
+                      d[x] = 0xff000000u | (r << 16) | (g << 8) | b;
+                  }
+              }
+              return 1;
+          }
           static void gl_flush_prim(void)
           {
               fb_ensure();
@@ -1722,6 +1787,7 @@ jobs:
               if (g_en_texrect && g_boundrect && g_boundrect < GTEX_MAX) { tx = &g_tex[g_boundrect]; rect = 1; }
               else if (g_en_tex2d && g_bound2d && g_bound2d < GTEX_MAX) tx = &g_tex[g_bound2d];
               int n = g_nvb;
+              if (fast_quad(tx, rect)) return;
               switch (g_prim) {
               case 4: for (int i = 0; i + 2 < n; i += 3) raster_tri(&g_vb[i], &g_vb[i + 1], &g_vb[i + 2], tx, rect); break;      /* TRIANGLES */
               case 5: for (int i = 0; i + 2 < n; i++) raster_tri(&g_vb[i], &g_vb[i + 1], &g_vb[i + 2], tx, rect); break;         /* TRIANGLE_STRIP */
@@ -1790,6 +1856,7 @@ jobs:
               if (g_vi.bits_per_pixel != 32 && g_vi.bits_per_pixel != 16) { LOG("[fb] bpp %u belum didukung\n", g_vi.bits_per_pixel); g_use_fb = 0; return; }
               g_fbmem = (uint8_t *)mmap(NULL, g_fi.smem_len, PROT_READ | PROT_WRITE, MAP_SHARED, g_fbdev, 0);
               if (g_fbmem == MAP_FAILED) { g_fbmem = NULL; LOG("[fb] mmap gagal: %s\n", strerror(errno)); g_use_fb = 0; return; }
+              g_fb_w0 = (int)g_vi.xres; g_fb_h0 = (int)g_vi.yres;
               ioctl(g_fbdev, FBIOBLANK, FB_BLANK_UNBLANK);
               { int t = open("/sys/class/graphics/fbcon/cursor_blink", O_WRONLY); if (t >= 0) { if (write(t, "0", 1) < 0) {} close(t); } }
               { int t = open("/dev/tty1", O_WRONLY); if (t >= 0) { const char *e = "\033[?25l\033[2J"; if (write(t, e, strlen(e)) < 0) {} close(t); } }
@@ -1816,6 +1883,11 @@ jobs:
               }
               uint32_t yo = g_vi.yoffset, xo = g_vi.xoffset;
               int bpp = (int)g_vi.bits_per_pixel;
+              if (bpp == 32 && g_dw == g_scr_w && g_dh == g_scr_h && g_vi.red.offset == 16 && g_vi.blue.offset == 0) {
+                  for (int y = 0; y < g_dh; y++)
+                      memcpy((uint32_t *)(g_fbmem + (size_t)(y + g_dy + yo) * g_fi.line_length) + g_dx + xo, g_fb + (size_t)y * g_scr_w, (size_t)g_scr_w * 4);
+                  goto presented;
+              }
               for (int y = 0; y < g_dh; y++) {
                   const uint32_t *src = g_fb + (size_t)g_mapy[y] * g_scr_w;
                   uint8_t *row = g_fbmem + (size_t)(y + g_dy + yo) * g_fi.line_length;
@@ -1838,6 +1910,7 @@ jobs:
                       }
                   }
               }
+          presented:
               ioctl(g_fbdev, FBIOPAN_DISPLAY, &g_vi);
               /* tahan ~60 fps */
               double now = mono_s(), want = g_last_present + 1.0 / 60.0;
@@ -2117,7 +2190,7 @@ jobs:
           H(h_glViewport)    {
               int w = (int)a[2], h = (int)a[3];
               LOG("[gl] glViewport(%d, %d, %d, %d)\n", (int)a[0], (int)a[1], w, h);
-              if (w > 0 && h > 0 && w <= 2048 && h <= 2048 && (w != g_scr_w || h != g_scr_h)) { g_scr_w = w; g_scr_h = h; free(g_fb); g_fb = NULL; }
+              if (!g_native_res && w > 0 && h > 0 && w <= 2048 && h <= 2048 && (w != g_scr_w || h != g_scr_h)) { g_scr_w = w; g_scr_h = h; free(g_fb); g_fb = NULL; }
               return 0;
           }
           H(h_glReadPixels)  { UNUSED; return 0; }
@@ -2834,8 +2907,9 @@ jobs:
                   else if (!strcmp(argv[i], "--no-fb")) g_use_fb = 0;
           #endif
               }
+              { const char *e = getenv("LUXOR_DEBUG"); if (e && atoi(e)) g_blocktrace = 1; }
               g_logf = fopen("loader_log.txt", "w");
-              LOG("luxor_mac_loader M1 (probe) r23-fcmpfix\napp: %s\n", app);
+              LOG("luxor_mac_loader M1 (probe) r24-speed\napp: %s\n", app);
           #ifndef DRYRUN
               signal(SIGABRT, crash_handler);
               signal(SIGSEGV, crash_handler);
