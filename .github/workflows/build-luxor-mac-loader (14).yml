@@ -1140,6 +1140,20 @@ jobs:
                       return nsstr(b);
                   }
                   if (!strcmp(sel, "isEqualToString:")) return strcmp(nsstr_c(self), nsstr_c(a[2])) == 0;
+                  if (!strcmp(sel, "capitalizedString") || !strcmp(sel, "uppercaseString") || !strcmp(sel, "lowercaseString")) {
+                      const char *src = nsstr_c(self); char b[256]; size_t n = strlen(src); if (n > 255) n = 255;
+                      int start = 1;
+                      for (size_t i = 0; i < n; i++) {
+                          unsigned char c = (unsigned char)src[i];
+                          if (sel[0] == 'u') c = (unsigned char)toupper(c);
+                          else if (sel[0] == 'l') c = (unsigned char)tolower(c);
+                          else { c = start ? (unsigned char)toupper(c) : (unsigned char)tolower(c); start = !isalnum(c); }
+                          b[i] = (char)c;
+                      }
+                      b[n] = 0;
+                      return nsstr(b);
+                  }
+                  if (!strcmp(sel, "characterAtIndex:")) { const char *src = nsstr_c(self); return a[2] < strlen(src) ? (uint32_t)(unsigned char)src[a[2]] : 0; }
               }
               if (!strcmp(cn, "NSFileManager")) {
                   if (!strcmp(sel, "changeCurrentDirectoryPath:")) {
@@ -2086,8 +2100,8 @@ jobs:
                               case 304: g_btn_l = dn; break;      /* A (muOS) */
                               case 305: g_btn_r = dn; break;      /* B (muOS) */
                               case 308: g_btn_slow = dn; break;   /* L1 = kursor pelan */
-                              case 307: if (dn) g_key_req = 1; break;   /* Y  = ketik nama + Enter */
-                              case 306: if (dn) g_key_req = 2; break;   /* X  = Backspace */
+                              case 306: if (dn) g_key_req = 1; break;   /* tombol kode 306 = ketik nama + Enter */
+                              case 307: if (dn) g_key_req = 2; break;   /* tombol kode 307 = Backspace */
                               case 309: if (dn) g_key_req = 3; break;   /* R1 = Enter */
                               default: break;
                               }
@@ -2639,7 +2653,9 @@ jobs:
                   e->type = types[i]; e->x = win_x(); e->y = win_y();
                   e->ch = (types[i] == 10 || types[i] == 11) ? kch : 0; e->kc = (types[i] == 10 || types[i] == 11) ? kkc : 0;
                   g_cur_event = e->obj;
-                  static int evl; if (evl < 30 && types[i] != 5 && types[i] != 6) { evl++; LOG("[input] event type=%d @%.0f,%.0f\n", types[i], g_cur_x, g_cur_y); }
+                  static int evl, kel;
+                  if (types[i] == 10 || types[i] == 11) { if (kel < 60) { kel++; LOG("[input] key %s ch=%d ('%c') keyCode=%d\n", types[i] == 10 ? "down" : "up", e->ch, e->ch >= 32 && e->ch < 127 ? e->ch : '?', e->kc); } }
+                  else if (evl < 30 && types[i] != 5 && types[i] != 6) { evl++; LOG("[input] event type=%d @%.0f,%.0f\n", types[i], g_cur_x, g_cur_y); }
                   if (g_sendev_imp > 1) {
                       int tr0 = g_trace; g_trace = 0;
                       int rr = call_guest_args(g_sendev_imp, g_app_obj, intern("sendEvent:"), e->obj, 5.0);
@@ -3048,7 +3064,7 @@ jobs:
               }
               { const char *e = getenv("LUXOR_DEBUG"); if (e && atoi(e)) g_blocktrace = 1; }
               g_logf = fopen("loader_log.txt", "w");
-              LOG("luxor_mac_loader M1 (probe) r29-keys\napp: %s\n", app);
+              LOG("luxor_mac_loader M1 (probe) r30-keys2\napp: %s\n", app);
           #ifndef DRYRUN
               signal(SIGABRT, crash_handler);
               signal(SIGSEGV, crash_handler);
@@ -3198,14 +3214,14 @@ jobs:
           LOADER_C_EOF
           cat > src/Luxor_Mac.sh <<'LUXOR_SH_EOF'
           #!/bin/sh
-          # Luxor Mac (PowerPC) -> Linux ARM64 | Milestone 1 | peluncur diagnostik v15 (muOS)
+          # Luxor Mac (PowerPC) -> Linux ARM64 | Milestone 1 | peluncur diagnostik v16 (muOS)
           # Skrip ini di ROMS/Ports ; folder "luxor_mac" (berisi luxor_mac_loader dan Luxor_Mac/Luxor.app)
           # dicari otomatis di beberapa lokasi umum.
           DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
           L1="$DIR/luxor_mac_launcher.txt"
 
           {
-            echo "== peluncur v15 mulai: $(date 2>&1)"
+            echo "== peluncur v16 mulai: $(date 2>&1)"
             echo "script : $0"
             echo "DIR    : $DIR"
           } > "$L1" 2>&1
@@ -3260,7 +3276,7 @@ jobs:
 
           rm -rf "$GAME/frames"
           # Kontrol: D-pad/stick = kursor, A = klik kiri, B = klik kanan, L1 = kursor pelan
-          # Y = ketik nama (LUXOR_NAME) + Enter, X = Backspace, R1 = Enter
+          # tombol kode 306 = ketik nama (LUXOR_NAME) + Enter, kode 307 = Backspace, R1 = Enter
           export LUXOR_NAME="${LUXOR_NAME:-PLAYER}"
           # batas waktu darurat (detik); 0 = tanpa batas. Keluar manual: SELECT+START atau tahan MENU 1 detik
           export LUXOR_TIMEOUT="${LUXOR_TIMEOUT:-0}"
