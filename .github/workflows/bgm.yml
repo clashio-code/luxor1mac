@@ -2431,6 +2431,10 @@ jobs:
               static uint32_t tid = 0x5000;
               uint8_t *p = g2h(a[7], 4); if (p) wbe32(p, ++tid);
               int run = g_aud_want && g_nthr < 32;
+              {   /* LUXOR_BGM=0: thread stream (musik) tidak dijalankan -> fps kembali normal, efek suara tetap */
+                  const char *e = getenv("LUXOR_BGM");
+                  if (e && !atoi(e) && strstr(describe(a[0]), "Stream_UpdateThread")) run = 0;
+              }
               if (run) {                        /* thread FMOD (stream/async) dijalankan bergantian sedikit tiap frame */
                   GThread *t = &g_thr[g_nthr++]; memset(t, 0, sizeof *t);
                   t->fn = a[0]; t->arg = a[1]; t->tid = tid; t->coop = 1;
@@ -3829,7 +3833,7 @@ jobs:
               { const char *e = getenv("LUXOR_DEBUG"); if (e && atoi(e)) g_blocktrace = 1; }
               { const char *e = getenv("LUXOR_EMU_COUNT"); if (e && atoi(e)) g_use_count = 1; }
               g_logf = fopen("loader_log.txt", "w");
-              LOG("luxor_mac_loader M1 (probe) r49-bgmnocut\napp: %s\n", app);
+              LOG("luxor_mac_loader M1 (probe) r50-bgmtoggle\napp: %s\n", app);
           #ifndef DRYRUN
               signal(SIGABRT, crash_handler);
               signal(SIGSEGV, crash_handler);
@@ -3990,14 +3994,14 @@ jobs:
           LOADER_C_EOF
           cat > src/Luxor_Mac.sh <<'LUXOR_SH_EOF'
           #!/bin/sh
-          # Luxor Mac (PowerPC) -> Linux ARM64 | Milestone 1 | peluncur diagnostik v21 (muOS)
+          # Luxor Mac (PowerPC) -> Linux ARM64 | Milestone 1 | peluncur diagnostik v22 (muOS)
           # Skrip ini di ROMS/Ports ; folder "luxor_mac" (berisi luxor_mac_loader dan Luxor_Mac/Luxor.app)
           # dicari otomatis di beberapa lokasi umum.
           DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
           L1="$DIR/luxor_mac_launcher.txt"
 
           {
-            echo "== peluncur v21 mulai: $(date 2>&1)"
+            echo "== peluncur v22 mulai: $(date 2>&1)"
             echo "script : $0"
             echo "DIR    : $DIR"
           } > "$L1" 2>&1
@@ -4064,6 +4068,8 @@ jobs:
           export LUXOR_NOSOUND="${LUXOR_NOSOUND:-0}"
           # 1 = keluarkan suara lewat aplay (ALSA); 0 = muat suara tapi tanpa keluaran
           export LUXOR_AUDIO="${LUXOR_AUDIO:-1}"
+          # 1 = musik latar (BGM) aktif, tapi fps turun ±setengah; 0 = hanya efek suara (fps normal)
+          export LUXOR_BGM="${LUXOR_BGM:-1}"
           { echo "-- memori:"; head -4 /proc/meminfo 2>&1; echo "overcommit: $(cat /proc/sys/vm/overcommit_memory 2>&1)"; echo "ulimit -v: $(ulimit -v 2>&1)"; } >> "$L1" 2>&1
           # buffer JIT: dari besar ke kecil sampai berhasil dialokasikan
           MB=64
