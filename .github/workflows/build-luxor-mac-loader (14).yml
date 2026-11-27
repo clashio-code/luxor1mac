@@ -2431,6 +2431,17 @@ jobs:
               enable_fpu_altivec();
               double t0 = now_s();
               while (1) {
+                  /* Emulasi bisa berhenti (batas 5 juta instruksi) tepat di alamat trap sebelum hook-nya jalan;
+                   * saat dilanjutkan, Unicorn kadang tidak memanggil hook di instruksi pertama, sehingga "blr"
+                   * di trap dieksekusi tanpa HLE (r3 = argumen, bukan hasil) -> data rusak.  Tangani manual. */
+                  if (pc >= TRAP_BASE && pc < TRAP_BASE + TRAP_SIZE) {
+                      static unsigned g_trap_resume;
+                      if (g_trap_resume++ < 5) LOG("[emu] lanjut di trap %08x: HLE dipanggil manual\n", pc);
+                      hook_code(g_uc, pc, 4, NULL);
+                      if (g_stop) return g_stop;
+                      pc = RPC();
+                      continue;
+                  }
                   uc_err e = uc_emu_start(g_uc, pc, 0xFFFFFFFFull, 5 * 1000000ull, 0);
                   if (g_stop) return g_stop;                      /* 1 = stop permintaan HLE, 2 = sentinel */
                   if (e != UC_ERR_OK) {
@@ -2987,7 +2998,7 @@ jobs:
               }
               { const char *e = getenv("LUXOR_DEBUG"); if (e && atoi(e)) g_blocktrace = 1; }
               g_logf = fopen("loader_log.txt", "w");
-              LOG("luxor_mac_loader M1 (probe) r25-perf\napp: %s\n", app);
+              LOG("luxor_mac_loader M1 (probe) r26-trapfix\napp: %s\n", app);
           #ifndef DRYRUN
               signal(SIGABRT, crash_handler);
               signal(SIGSEGV, crash_handler);
