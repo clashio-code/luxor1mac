@@ -474,6 +474,88 @@ jobs:
               return g_rune_tbl;
           }
 
+          /* ===================== fungsi tiruan NATIVE-PPC (tanpa keluar dari emulator) =====================
+           * Fungsi kecil yang dipanggil puluhan ribu kali/detik ditulis langsung sebagai kode PPC di region
+           * "native" (di luar area trap, jadi tidak memicu hook).  Tiap panggilan tidak lagi menghentikan JIT. */
+          #define NATIVE_BASE 0x6e800000u
+          #define NATIVE_SIZE 0x00100000u
+          static uint32_t g_native_ptr = NATIVE_BASE;
+          static int g_native_on = 1;
+          static uint32_t native_emit(const uint32_t *code, int n)
+          {
+              uint32_t a = g_native_ptr;
+              uint8_t *p = g2h(a, (uint32_t)n * 4);
+              if (!p) return 0;
+              for (int i = 0; i < n; i++) wbe32(p + 4 * i, code[i]);
+              g_native_ptr += ((uint32_t)n * 4 + 15) & ~15u;
+              return a;
+          }
+          static uint32_t hle_symbol(const char *name, int want_data);
+          static uint32_t native_for(const char *name)
+          {
+              if (!g_native_on) return 0;
+              if (!strcmp(name, "_pthread_mutex_lock") || !strcmp(name, "_pthread_mutex_unlock") || !strcmp(name, "_pthread_mutex_trylock")) {
+                  static const uint32_t c[] = { 0x38600000u, 0x4e800020u };                       /* li r3,0 ; blr */
+                  return native_emit(c, 2);
+              }
+              if (!strcmp(name, "_strlen")) {
+                  static const uint32_t c[] = {
+                      0x38830000u,                    /* addi r4,r3,0 */
+                      0x88a40000u,                    /* lbz r5,0(r4) */
+                      0x38840001u,                    /* addi r4,r4,1 */
+                      0x2c050000u,                    /* cmpwi r5,0 */
+                      0x4082fff4u,                    /* bne -12 */
+                      0x7c632050u,                    /* subf r3,r3,r4 */
+                      0x3863ffffu,                    /* addi r3,r3,-1 */
+                      0x4e800020u };
+                  return native_emit(c, 8);
+              }
+              if (!strcmp(name, "_memcmp")) {
+                  static const uint32_t c[] = {
+                      0x2c050000u,                    /* 0  cmpwi r5,0 */
+                      0x41820024u,                    /* 4  beq +36 -> ret0 */
+                      0x7ca903a6u,                    /* 8  mtctr r5 */
+                      0x88c30000u,                    /* 12 lbz r6,0(r3) */
+                      0x88e40000u,                    /* 16 lbz r7,0(r4) */
+                      0x38630001u,                    /* 20 addi r3,r3,1 */
+                      0x38840001u,                    /* 24 addi r4,r4,1 */
+                      0x7d073051u,                    /* 28 subf. r8,r7,r6 */
+                      0x40820010u,                    /* 32 bne +16 -> out */
+                      0x4200ffe8u,                    /* 36 bdnz -24 -> 12 */
+                      0x38600000u,                    /* 40 li r3,0 */
+                      0x4e800020u,                    /* 44 blr */
+                      0x38680000u,                    /* 48 addi r3,r8,0 */
+                      0x4e800020u };
+                  return native_emit(c, 14);
+              }
+              if (!strcmp(name, "_memset")) {
+                  /* n <= 64: loop native; lebih besar: lompat ke trap HLE memset (cepat di host) */
+                  Hle *h = hle_find("<memset_besar>");
+                  uint32_t slow = h ? h->addr : 0;
+                  if (!slow) return 0;
+                  uint32_t c[] = {
+                      0x28050040u,                    /* 0  cmplwi r5,64 */
+                      0x41810024u,                    /* 4  bgt +36 -> slow */
+                      0x2c050000u,                    /* 8  cmpwi r5,0 */
+                      0x4d820020u,                    /* 12 beqlr */
+                      0x7ca903a6u,                    /* 16 mtctr r5 */
+                      0x38c30000u,                    /* 20 addi r6,r3,0 */
+                      0x98860000u,                    /* 24 stb r4,0(r6) */
+                      0x38c60001u,                    /* 28 addi r6,r6,1 */
+                      0x4200fff8u,                    /* 32 bdnz -8 */
+                      0x4e800020u,                    /* 36 blr */
+                      0x3d800000u | (slow >> 16),     /* 40 lis r12,hi */
+                      0x618c0000u | (slow & 0xffff),  /* 44 ori r12,r12,lo */
+                      0x7d8903a6u,                    /* 48 mtctr r12 */
+                      0x4e800420u };                  /* 52 bctr */
+                  return native_emit(c, 14);
+              }
+              if (!strcmp(name, "_sqrt")) {
+                  static const uint32_t c[] = { 0xfc20082cu, 0x4e800020u };                       /* fsqrt f1,f1 ; blr */
+                  return native_emit(c, 2);
+              }
+              return 0;
+          }
           static uint32_t hle_symbol(const char *name, int want_data)
           {
               Hle *h = hle_find(name);
@@ -505,6 +587,8 @@ jobs:
                       if (!strcmp(name, "___sF")) sz = 0x400;
                       h->addr = data_alloc(sz);
                   }
+              } else if (h->known && (h->addr = native_for(name)) != 0) {
+                  static int nl; if (nl++ < 12) LOG("[native] %s -> kode PPC native @%08x\n", name, h->addr);
               } else {
                   if (g_trap_slots * 16 >= TRAP_SIZE) { LOG("FATAL: trap slot habis\n"); exit(2); }
                   h->addr = TRAP_BASE + g_trap_slots++ * 16;
@@ -3473,7 +3557,7 @@ jobs:
               { const char *e = getenv("LUXOR_DEBUG"); if (e && atoi(e)) g_blocktrace = 1; }
               { const char *e = getenv("LUXOR_EMU_COUNT"); if (e && atoi(e)) g_use_count = 1; }
               g_logf = fopen("loader_log.txt", "w");
-              LOG("luxor_mac_loader M1 (probe) r38-prof2\napp: %s\n", app);
+              LOG("luxor_mac_loader M1 (probe) r39-native\napp: %s\n", app);
           #ifndef DRYRUN
               signal(SIGABRT, crash_handler);
               signal(SIGSEGV, crash_handler);
@@ -3507,6 +3591,12 @@ jobs:
                   } else LOG("HLE mode: hook + cadangan 'sc' (default)\n");
               }
           #endif
+              map_region("native", NATIVE_BASE, NATIVE_SIZE);
+              { const char *e = getenv("LUXOR_NATIVE"); if (e && !atoi(e)) g_native_on = 0; }
+              {   /* slot trap cadangan untuk memset besar */
+                  Hle *mh; hle_symbol("<memset_besar>", 0); mh = hle_find("<memset_besar>");
+                  if (mh) { mh->fn = h_memset; mh->known = 1; }
+              }
               hle_state_init();
               snprintf(g_app_path, sizeof g_app_path, "%s", app);
               {
